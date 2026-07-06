@@ -1,0 +1,24 @@
+name = "discord-secretary-bot"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+[vars]
+TIMEZONE = "Asia/Tokyo"
+MORNING_REPORT_HOUR = "7"
+MORNING_REPORT_TIME = "07:00"
+EVENING_REPORT_TIME = "22:30"
+MONTHLY_EXPENSE_REPORT_TIME = "12:00"
+PRE_NOTIFY_MINUTES = "15"
+STALE_TODO_DAYS = "2"
+GEMINI_MODEL = "gemini-3.5-flash"
+SETTING_CHANNEL_ID = "1521813241091723284"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "discord_secretary_bot"
+database_id = "6a93f4e0-2192-4255-88fa-fd620b682c70"
+
+[triggers]
+crons = [
+  "* * * * *"
+]

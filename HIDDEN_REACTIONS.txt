@@ -1,0 +1,21 @@
+Hidden reactions
+================
+
+This file documents small prank-style reactions that are intentionally not listed in README.md or USER_GUIDE.ja.md.
+
+1. Adult-input prank reaction
+
+Purpose:
+- If a chat message in the configured chat channel contains clearly adult/NSFW-like wording, the bot replies with a fixed Yuuka-style warning joke.
+- The bot does not call Gemini for this branch.
+- The bot does not route the user to another model, API, service, or bypass.
+
+Where to remove or edit:
+- Detection: src/index.ts -> isHiddenAdultPrankTrigger()
+- Trigger words: src/hidden-reaction-patterns.ts
+- Reply text: src/yuuka-phrases.ts -> YUUKA_PHRASES.hiddenAdultPrank
+- Call site: src/index.ts -> handleChatMessage(), near the top before classifyChatEvents()
+
+Design note:
+- This is intentionally a harmless fake-out. It creates the feeling of a hidden feature without enabling adult content or external model/API redirection.
+- Do not add ordinary romance words such as 結婚, 恋愛, 好き, 照れ. Those should remain normal Yuuka roleplay handled by Gemini.

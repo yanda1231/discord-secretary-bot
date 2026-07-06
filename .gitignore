@@ -1,0 +1,13 @@
+node_modules
+.wrangler
+.dev.vars
+dist
+*.log
+
+# OS/editor cruft
+.DS_Store
+*.bak
+*.bak2
+
+# owner-only doc (not for public repo)
+MIGRATION_OWNER_GUIDE.ja.md
