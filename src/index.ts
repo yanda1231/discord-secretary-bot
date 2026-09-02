@@ -1117,6 +1117,8 @@ async function pollChannel(env: Env, kind: string, channelId: string): Promise<v
           await postDiscordReply(env, channelId, message.id, YUUKA_PHRASES.geminiUnavailable);
           await clearGeminiMessageFailure(env, message.id);
         }
+      } else {
+        await notifyFailureOncePerDay(env, "message_error", String(error));
       }
     }
 
@@ -1352,6 +1354,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
         `先生の発言: ${text}`
       ].filter(Boolean).join("\n\n"), 0.75);
       if (answer) await postDiscordReply(env, message.channel_id, message.id, answer);
+      else await notifyFailureOncePerDay(env, "empty_reply", "msg:" + message.id);
     }
   }
 }
@@ -2464,6 +2467,22 @@ async function dailySummarySent(env: Env, key: string): Promise<boolean> {
 
 async function markDailySummarySent(env: Env, key: string): Promise<void> {
   await env.DB.prepare("INSERT OR IGNORE INTO daily_summaries (summary_key) VALUES (?)").bind(key).run();
+}
+
+async function notifyFailureOncePerDay(env: Env, type: string, detail: string): Promise<void> {
+  try {
+    const parts = zonedParts(new Date(), env.TIMEZONE ?? "Asia/Tokyo");
+    const todayKey = `${parts.year}-${pad(parts.month)}-${pad(parts.day)}`;
+    const key = `failure_notice_${type}_${todayKey}`;
+    if (await dailySummarySent(env, key)) return;
+    const channels = await loadChannels(env);
+    if (!channels.report) return;
+    console.log("failure-notice posting", type);
+    await postDiscordMessage(env, channels.report, `⚠️ ユウカ内部で失敗を検知（種別: ${type}）。詳細: ${detail.slice(0, 120)}。Cloudflareログを確認してください`);
+    await markDailySummarySent(env, key);
+  } catch (error) {
+    console.error("notifyFailureOncePerDay failed", error);
+  }
 }
 
 async function recordGeminiMessageFailure(env: Env, kind: string, message: DiscordMessage): Promise<number> {
