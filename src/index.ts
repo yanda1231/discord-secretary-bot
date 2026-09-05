@@ -1,5 +1,8 @@
 import { YUUKA_PHRASES } from "./yuuka-phrases";
 import { HIDDEN_ADULT_PRANK_HINTS, HIDDEN_ADULT_PRANK_KEYWORDS } from "./hidden-reaction-patterns";
+import expenseCategories from "./expense-categories.json";
+
+const EXPENSE_CATEGORIES = expenseCategories as string[];
 
 export interface Env {
   DB: D1Database;
@@ -45,6 +48,7 @@ type DiscordInteraction = {
         value?: string;
       }[];
     }[];
+    values?: string[];
   };
 };
 
@@ -113,6 +117,7 @@ type ExpenseRow = {
   amount: number;
   category: string | null;
   memo: string;
+  store: string | null;
   spent_at: string;
   created_at: string;
 };
