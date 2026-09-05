@@ -53,7 +53,7 @@ export const YUUKA_PHRASES = {
       "でも今の入力を私に処理させようとした事実は、かなり問題のある変数です。"
     ].join("\n")
   ],
-  commandGuide: [
+  commandGuide: (categories: readonly string[]) => [
     "先生、使えるスラッシュコマンドを整理します。",
     "",
     "`/todo add`",
@@ -72,7 +72,7 @@ export const YUUKA_PHRASES = {
     "未通知のリマインダーを表示します。不要なものはボタンで削除できます。",
     "",
     "`/expense list`",
-    "支出メモを表示します。省略すると全件、必要なら今月分だけ確認できます。",
+    `支出メモを大分類・品物・店の階層で表示します。大分類: ${categories.join("、")}。省略すると全件、必要なら今月分だけ確認できます。`,
     "",
     "`/guide`",
     "この説明を表示します。",

@@ -8,15 +8,15 @@ if (!token || !channelId) {
   console.error("DISCORD_BOT_TOKEN and DISCORD_WELCOME_CHANNEL_ID are required.");
   console.error("Usage:");
   console.error('  DISCORD_BOT_TOKEN="Bot Token" DISCORD_WELCOME_CHANNEL_ID="channel id" npm run welcome:post');
-  console.error('  or: DISCORD_BOT_TOKEN="Bot Token" npm run welcome:post -- "channel id"');
+  console.error('  or: DISCORD_BOT_TOKEN="Bot Token" npm run welcome:post -- "channel id" [message file]');
   process.exit(1);
 }
 
-const messagePath = resolve("WELCOME_MESSAGE.md");
+const messagePath = resolve(process.argv[3] ?? "WELCOME_MESSAGE.md");
 const message = (await readFile(messagePath, "utf8")).trim();
 
 if (message.length > 2000) {
-  console.error(`WELCOME_MESSAGE.md is ${message.length} characters. Discord messages must be 2000 characters or less.`);
+  console.error(`${messagePath} is ${message.length} characters. Discord messages must be 2000 characters or less.`);
   process.exit(1);
 }
 
