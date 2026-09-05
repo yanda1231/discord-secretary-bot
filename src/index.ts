@@ -1853,6 +1853,7 @@ async function classifyChatEvents(env: Env, text: string, replyChain: ReplyConte
     "明確に予定・時刻・リマインド依頼ならreminder_candidate。リマインダーを消す/削除する/いらないという依頼ならreminder_delete_candidate。やること・締切・todo依頼ならtodo_candidate。完了報告ならdone_candidate。支払い・購入・課金・浪費・金額の記録ならexpense_candidate。感情ケアや普通の会話で返答した方がよければchat_reply。",
     "介入不要なら [{\"type\":\"none\"}]。",
     "expense_candidateではitemに品物、storeに店を入れ、categoryは大分類一覧から1つだけ選んでください。contentは従来形式のフォールバックとして残しても構いません。",
+    "expense_candidateのitemは品物の短い名前。storeは発言に店名・購入場所が明示されているときだけ入れ、無ければnull。推測や一般名（コンビニ等）で埋めない。",
     "出力形式: {\"events\":[{\"type\":\"chat_reply|todo_candidate|reminder_candidate|reminder_delete_candidate|done_candidate|expense_candidate|none\",\"content\":\"...\",\"item\":\"品物\",\"store\":\"店\",\"datetime\":\"YYYY-MM-DDTHH:mm:ss+09:00 または null\",\"recurrence_rule\":null または {\"type\":\"daily|weekly|monthly\",\"interval\":1,\"weekdays\":[1],\"month_days\":[1],\"time\":\"09:00\",\"timezone\":\"Asia/Tokyo\"},\"recurrence_label\":\"毎週月曜\" または null,\"todo_id\":数値またはnull,\"reminder_id\":数値またはnull,\"amount\":金額数値またはnull,\"category\":\"大分類一覧のいずれか\",\"confidence\":\"high|medium|low\",\"reply\":\"...\"}]}",
     "chat_replyのreplyはユウカとして1〜3文。todo/reminder/doneの事実は変えない。",
     "雑談では、ユーザーが求めていない限り会話を打ち切ったり、別行動へ誘導したりしない。照れ隠しは会話の返答として自然な範囲に留める。",
