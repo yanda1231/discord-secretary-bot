@@ -1,5 +1,17 @@
 import { YUUKA_PHRASES } from "./yuuka-phrases";
 import { HIDDEN_ADULT_PRANK_HINTS, HIDDEN_ADULT_PRANK_KEYWORDS } from "./hidden-reaction-patterns";
+import {
+  buildExpenseHierarchyParts,
+  findCategoryDesignation,
+  fitDiscordContent,
+  hasCorrectionCue,
+  normalizeExpenseCategory,
+  parseExpenseCorrection,
+  resolveCorrectionTarget,
+  type CorrectionTargetDecision,
+  type ExpenseCorrection
+} from "./expense-logic";
+import { YUUKA_MANUAL } from "./yuuka-manual";
 import expenseCategories from "./expense-categories.json";
 
 const EXPENSE_CATEGORIES = expenseCategories as string[];
@@ -164,6 +176,8 @@ type ChatEvent = {
   reminder_id?: number | null;
   amount?: number | null;
   category?: string | null;
+  item?: string | null;
+  store?: string | null;
   confidence?: "high" | "medium" | "low";
   reply?: string;
 };
@@ -171,6 +185,16 @@ type ChatEvent = {
 type MessageProcessResult = "processed" | "retry" | "ignored";
 
 type PreNotifyMode = "ask" | "fixed" | "off";
+
+type PendingActionRow = {
+  id: string;
+  kind: string;
+  payload: string;
+  requested_by: string;
+  channel_id?: string;
+  expires_at: string;
+  message_id?: string | null;
+};
 
 const INTERACTION = {
   PING: 1,
@@ -275,7 +299,7 @@ async function handleCommand(interaction: DiscordInteraction, env: Env, ctx: Exe
   if (name === "todo") return handleTodoCommand(interaction, env, ctx);
   if (name === "reminder") return handleReminderCommand(interaction, env, ctx);
   if (name === "expense") return handleExpenseCommand(interaction, env);
-  if (name === "guide") return reply(YUUKA_PHRASES.commandGuide, true);
+  if (name === "guide") return reply(YUUKA_PHRASES.commandGuide(EXPENSE_CATEGORIES), true);
   if (name === "backup") {
     ctx.waitUntil(processBackupCommand(interaction, env));
     return deferReply(true);
@@ -457,32 +481,15 @@ async function handleComponent(interaction: DiscordInteraction, env: Env): Promi
       : `todo #${id} は見つからないか、すでに完了済みです。`);
   }
 
+  if (prefix === "expense_cat" && id) {
+    return processExpenseCategorySelect(interaction, env, id);
+  }
+
   if (prefix === "expense" && id && action) {
     const pending = await env.DB.prepare(
       "SELECT id, kind, payload, requested_by, expires_at FROM pending_actions WHERE id = ?"
-    ).bind(id).first<{ id: string; kind: string; payload: string; requested_by: string; expires_at: string }>();
-    if (!pending) return updateMessage("この確認は見つからないか、処理済みです。");
-    if (new Date(pending.expires_at).getTime() < Date.now()) {
-      const payload = JSON.parse(pending.payload) as Record<string, string | number | null>;
-      await env.DB.prepare("DELETE FROM pending_actions WHERE id = ?").bind(id).run();
-      return updateMessage(expiredPendingContent(pending.kind, payload));
-    }
-    if (action === "cancel") {
-      await env.DB.prepare("DELETE FROM pending_actions WHERE id = ?").bind(id).run();
-      return updateMessage(expenseCancelledContent(JSON.parse(pending.payload) as Record<string, string | number | null>));
-    }
-    const payload = JSON.parse(pending.payload) as Record<string, string | number | null>;
-    if (isHiddenAdultPrankTrigger(pendingPayloadText(payload))) {
-      await env.DB.prepare("DELETE FROM pending_actions WHERE id = ?").bind(id).run();
-      return updateMessage(randomItem(YUUKA_PHRASES.hiddenAdultPranks));
-    }
-    const amount = Math.max(0, Math.round(Number(payload.amount ?? 0)));
-    if (!amount) return updateMessage("金額が読み取れませんでした。もう一度書き直してください。");
-    await env.DB.prepare(
-      "INSERT INTO expenses (amount, category, memo, spent_at) VALUES (?, ?, ?, ?)"
-    ).bind(amount, stringOrNull(payload.category), String(payload.memo ?? payload.content ?? ""), String(payload.spent_at ?? new Date().toISOString())).run();
-    await env.DB.prepare("DELETE FROM pending_actions WHERE id = ?").bind(id).run();
-    return updateMessage(expenseRecordedContent(payload));
+    ).bind(id).first<PendingActionRow>();
+    return processExpensePendingAction(interaction, env, pending, action);
   }
 
   if (prefix === "expense_delete" && id) {
@@ -586,6 +593,9 @@ async function handleComponent(interaction: DiscordInteraction, env: Env): Promi
   ).bind(id).first<{ id: string; kind: string; payload: string; requested_by: string; expires_at: string }>();
 
   if (!pending) return updateMessage("この確認は見つからないか、処理済みです。");
+  if (pending.kind === "expense") {
+    return processExpensePendingAction(interaction, env, pending, action);
+  }
   if (new Date(pending.expires_at).getTime() < Date.now()) {
     const payload = JSON.parse(pending.payload) as Record<string, string | number | null>;
     await env.DB.prepare("DELETE FROM pending_actions WHERE id = ?").bind(id).run();
@@ -700,17 +710,139 @@ async function handleComponent(interaction: DiscordInteraction, env: Env): Promi
       : `リマインダー #${reminderId} は見つからないか、すでに削除済みです。`);
   }
 
-  if (pending.kind === "expense") {
-    const amount = Math.max(0, Math.round(Number(payload.amount ?? 0)));
-    if (!amount) return updateMessage("金額が読み取れませんでした。もう一度書き直してください。");
-    await env.DB.prepare(
-      "INSERT INTO expenses (amount, category, memo, spent_at) VALUES (?, ?, ?, ?)"
-    ).bind(amount, stringOrNull(payload.category), String(payload.memo ?? payload.content ?? ""), String(payload.spent_at ?? new Date().toISOString())).run();
-    await env.DB.prepare("DELETE FROM pending_actions WHERE id = ?").bind(id).run();
-    return updateMessage(expenseRecordedContent(payload));
+  return updateMessage("未対応の確認種別です。");
+}
+
+const EXPENSE_PENDING_UNAVAILABLE = "その候補は期限切れか処理済みです。";
+
+function ignorePendingInteraction(): Response {
+  return json({
+    type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
+    data: { content: "", flags: EPHEMERAL }
+  });
+}
+
+function expensePendingPayload(pending: PendingActionRow): Record<string, string | number | null> {
+  try {
+    return JSON.parse(pending.payload) as Record<string, string | number | null>;
+  } catch {
+    return {};
+  }
+}
+
+function isPendingOwner(interaction: DiscordInteraction, pending: PendingActionRow): boolean {
+  return interactionUser(interaction).id === pending.requested_by;
+}
+
+async function processExpensePendingAction(
+  interaction: DiscordInteraction,
+  env: Env,
+  pending: PendingActionRow | null,
+  action: string
+): Promise<Response> {
+  if (!pending || pending.kind !== "expense") return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+  if (!isPendingOwner(interaction, pending)) return ignorePendingInteraction();
+
+  const payload = expensePendingPayload(pending);
+  if (new Date(pending.expires_at).getTime() < Date.now()) {
+    await env.DB.prepare("DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?")
+      .bind(pending.id, pending.requested_by)
+      .run();
+    return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
   }
 
-  return updateMessage("未対応の確認種別です。");
+  if (action === "cancel") {
+    const deleted = await env.DB.prepare(
+      "DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?"
+    ).bind(pending.id, pending.requested_by).run();
+    return updateMessage(deleted.meta.changes
+      ? expenseCancelledContent(payload)
+      : EXPENSE_PENDING_UNAVAILABLE);
+  }
+  if (action !== "ok") return reply("未対応の支出ボタンです。", true);
+
+  const latest = await env.DB.prepare(
+    "SELECT id, kind, payload, requested_by, channel_id, expires_at, message_id FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?"
+  ).bind(pending.id, pending.requested_by).first<PendingActionRow>();
+  if (!latest) return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+  return recordExpensePendingAction(env, latest, expensePendingPayload(latest));
+}
+
+async function recordExpensePendingAction(
+  env: Env,
+  pending: PendingActionRow,
+  payload: Record<string, string | number | null>
+): Promise<Response> {
+  if (new Date(pending.expires_at).getTime() < Date.now()) {
+    await env.DB.prepare("DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?")
+      .bind(pending.id, pending.requested_by)
+      .run();
+    return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+  }
+  if (isHiddenAdultPrankTrigger(pendingPayloadText(payload))) {
+    await env.DB.prepare("DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?")
+      .bind(pending.id, pending.requested_by)
+      .run();
+    return updateMessage(randomItem(YUUKA_PHRASES.hiddenAdultPranks));
+  }
+
+  const amount = Math.max(0, Math.round(Number(payload.amount ?? 0)));
+  if (!amount) return updateMessage("金額が読み取れませんでした。もう一度書き直してください。");
+  const category = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORIES);
+  const memo = String(payload.memo ?? payload.item ?? payload.content ?? "");
+  const store = stringOrNull(payload.store);
+  const spentAt = String(payload.spent_at ?? new Date().toISOString());
+  const deleted = await env.DB.prepare(
+    "DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?"
+  ).bind(pending.id, pending.requested_by).run();
+  if (!deleted.meta.changes) return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+
+  await env.DB.prepare(
+    "INSERT INTO expenses (amount, category, memo, store, spent_at) VALUES (?, ?, ?, ?, ?)"
+  ).bind(amount, category, memo, store, spentAt).run();
+  return updateMessage(expenseRecordedContent({
+    ...payload,
+    amount,
+    category,
+    memo,
+    store,
+    spent_at: spentAt
+  }));
+}
+
+async function processExpenseCategorySelect(interaction: DiscordInteraction, env: Env, id: string): Promise<Response> {
+  const pending = await env.DB.prepare(
+    "SELECT id, kind, payload, requested_by, channel_id, expires_at, message_id FROM pending_actions WHERE id = ? AND kind = 'expense'"
+  ).bind(id).first<PendingActionRow>();
+  if (!pending) return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+  if (!isPendingOwner(interaction, pending)) return ignorePendingInteraction();
+  if (new Date(pending.expires_at).getTime() < Date.now()) {
+    await env.DB.prepare("DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?")
+      .bind(id, pending.requested_by)
+      .run();
+    return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+  }
+
+  const selected = interaction.data?.values?.[0]?.normalize("NFKC").trim();
+  const category = selected
+    ? EXPENSE_CATEGORIES.find((candidate) => candidate.normalize("NFKC") === selected)
+    : undefined;
+  if (!category) return reply("その大分類は一覧にありません。プルダウンから選んでください。", true);
+
+  const updated = await env.DB.prepare(
+    "UPDATE pending_actions SET payload = json_set(payload, '$.category', ?) WHERE id = ? AND kind = 'expense' AND requested_by = ?"
+  ).bind(category, id, pending.requested_by).run();
+  if (!updated.meta.changes) return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+
+  const latest = await env.DB.prepare(
+    "SELECT id, kind, payload, requested_by, channel_id, expires_at, message_id FROM pending_actions WHERE id = ? AND kind = 'expense'"
+  ).bind(id).first<PendingActionRow>();
+  if (!latest) return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
+  const payload = expensePendingPayload(latest);
+  return updateMessageWithComponents(
+    pendingContent("expense", payload),
+    pendingExpenseComponents(id, payload)
+  );
 }
 
 async function handleModalSubmit(interaction: DiscordInteraction, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -963,11 +1095,11 @@ function expenseListWithDeleteButtons(expenses: ExpenseRow[], range: string, env
   return json({
     type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
     data: {
-      content: [
+      content: fitDiscordContent([
         formatExpenses(expenses, range, env),
         "",
         "間違って登録した支出メモは下のボタンで削除できます。"
-      ].join("\n").slice(0, 1900),
+      ], 1900),
       flags: EPHEMERAL,
       components: rows
     }
@@ -1046,18 +1178,19 @@ async function createPendingPost(env: Env, channelId: string, userId: string, ki
       { type: 2, style: 3, label: okLabel, custom_id: `confirm:${id}:ok` },
       { type: 2, style: 4, label: cancelLabel, custom_id: `confirm:${id}:cancel` }
     ]
-  }] : kind === "expense" ? [{
-    type: 1,
-    components: [
-      { type: 2, style: 3, label: "記録する", custom_id: `expense:${id}:ok` },
-      { type: 2, style: 4, label: "記録しない", custom_id: `expense:${id}:cancel` }
-    ]
-  }] : pendingComponents(id, pendingComponentOptions(kind, preparedPayload));
-  await postDiscordPayload(env, channelId, {
+  }] : kind === "expense"
+    ? pendingExpenseComponents(id, payloadWithContent)
+    : pendingComponents(id, pendingComponentOptions(kind, preparedPayload));
+  const posted = await postDiscordPayload(env, channelId, {
     content: kind === "todo" || kind === "reminder" || kind === "expense" ? pendingContent(kind, payloadWithContent) : content,
     components,
     ...(replyToMessageId ? { message_reference: { message_id: replyToMessageId, channel_id: channelId } } : {})
   });
+  if (posted?.id) {
+    await env.DB.prepare("UPDATE pending_actions SET message_id = ? WHERE id = ? AND kind = ?")
+      .bind(posted.id, id, kind)
+      .run();
+  }
 }
 
 async function pollNaturalLanguageChannels(env: Env): Promise<void> {
@@ -1230,11 +1363,217 @@ async function handleReminderMessage(env: Env, message: DiscordMessage): Promise
   }, content);
 }
 
+function messageReferenceId(message: DiscordMessage): string | undefined {
+  return message.message_reference?.message_id ?? message.referenced_message?.id;
+}
+
+async function referencedMessageForCorrection(env: Env, message: DiscordMessage): Promise<DiscordMessage | null> {
+  if (message.referenced_message?.author) {
+    return {
+      id: message.referenced_message.id,
+      channel_id: message.referenced_message.channel_id ?? message.channel_id,
+      content: message.referenced_message.content,
+      timestamp: "",
+      author: message.referenced_message.author ?? { id: "unknown" },
+      message_reference: message.referenced_message.message_reference
+    };
+  }
+  const referenceId = messageReferenceId(message);
+  if (referenceId) {
+    const fetched = await fetchDiscordMessage(env, message.channel_id, referenceId);
+    if (fetched) return fetched;
+  }
+  if (!message.referenced_message) return null;
+  return {
+    id: message.referenced_message.id,
+    channel_id: message.referenced_message.channel_id ?? message.channel_id,
+    content: message.referenced_message.content,
+    timestamp: "",
+    author: message.referenced_message.author ?? { id: "unknown" },
+    message_reference: message.referenced_message.message_reference
+  };
+}
+
+async function handleExpenseCorrectionEntry(env: Env, message: DiscordMessage, text: string): Promise<boolean> {
+  const referenceId = messageReferenceId(message);
+  const isReply = Boolean(referenceId);
+  const referencedMessage = isReply ? await referencedMessageForCorrection(env, message) : null;
+  const referencedPending = referenceId
+    ? await env.DB.prepare(
+      "SELECT id, kind, payload, requested_by, channel_id, expires_at, message_id FROM pending_actions WHERE message_id = ? AND channel_id = ? AND kind = 'expense'"
+    ).bind(referenceId, message.channel_id).first<PendingActionRow>()
+    : null;
+  const activeCandidates = !isReply && hasCorrectionCue(text)
+    ? (await env.DB.prepare(
+      "SELECT id, kind, payload, requested_by, channel_id, expires_at, message_id FROM pending_actions WHERE kind = 'expense' AND requested_by = ? AND channel_id = ? ORDER BY created_at ASC"
+    ).bind(message.author.id, message.channel_id).all<PendingActionRow>()).results?.filter((candidate) => new Date(candidate.expires_at).getTime() >= Date.now()) ?? []
+    : [];
+  const referencedBotExpenseCard = Boolean(
+    referencedMessage?.author.bot && referencedMessage.content.includes("支出候補を検出しました。")
+  );
+  const decision: CorrectionTargetDecision = resolveCorrectionTarget({
+    isReply,
+    referencedPending: Boolean(referencedPending),
+    referencedBotExpenseCard,
+    pendingCount: activeCandidates.length
+  });
+
+  if (decision === "reply_match") {
+    if (!referencedPending) return true;
+    if (referencedPending.requested_by !== message.author.id) return true;
+    await handleExpenseCorrection(env, message, referencedPending);
+    return true;
+  }
+  if (decision === "reply_expired_or_processed") {
+    await postDiscordReply(env, message.channel_id, message.id, "その候補は期限切れか処理済みです。もう一度教えてください。");
+    return true;
+  }
+  if (decision === "ambiguous") {
+    await postDiscordReply(env, message.channel_id, message.id, "どのカードか、そのカードにリプライで教えてください。");
+    return true;
+  }
+  if (decision === "single_pending") {
+    const candidate = activeCandidates[0];
+    if (candidate) await handleExpenseCorrection(env, message, candidate);
+    return true;
+  }
+  return false;
+}
+
+async function parseExpenseCorrectionWithAi(env: Env, text: string, payload: Record<string, string | number | null>): Promise<ExpenseCorrection> {
+  const prompt = [
+    "支出候補の訂正文を読み、変わる項目だけJSONで返してください。変えない項目は省略してください。",
+    "使用できるキー: category, memo, store, amount, spent_at",
+    `大分類一覧: ${EXPENSE_CATEGORIES.join("、")}`,
+    "categoryは大分類一覧から選び、一覧外ならその他にしてください。amountは整数の円。",
+    "出力形式: {\"category\":\"雑費\",\"memo\":\"電池\",\"store\":\"まいばすけっと\",\"amount\":500,\"spent_at\":\"2026-09-05T00:00:00+09:00\"}",
+    `現在の候補: ${JSON.stringify(payload)}`,
+    `訂正文: ${text}`
+  ].join("\n\n");
+  const raw = await geminiText(env, prompt);
+  const jsonText = raw.match(/\{[\s\S]*\}/)?.[0] ?? "{}";
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    const correction: ExpenseCorrection = {};
+    if (Object.prototype.hasOwnProperty.call(parsed, "category")) {
+      correction.category = normalizeExpenseCategory(parsed.category, EXPENSE_CATEGORIES);
+    }
+    for (const key of ["memo", "store", "spent_at"] as const) {
+      if (!Object.prototype.hasOwnProperty.call(parsed, key)) continue;
+      const value = parsed[key];
+      if (value === null) {
+        correction[key] = null;
+      } else if (typeof value === "string" && value.trim()) {
+        correction[key] = value.trim();
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(parsed, "amount")) {
+      const amount = Number(parsed.amount);
+      if (Number.isSafeInteger(amount) && amount > 0) correction.amount = amount;
+    }
+    return correction;
+  } catch {
+    return {};
+  }
+}
+
+function correctionFieldEntries(correction: ExpenseCorrection): [string, string | number | null][] {
+  return (Object.entries(correction) as [string, string | number | null][])
+    .filter(([key, value]) => ["category", "memo", "store", "amount", "spent_at"].includes(key) && value !== undefined);
+}
+
+function expenseCorrectionReply(correction: ExpenseCorrection): string {
+  const changed = correctionFieldEntries(correction).map(([key, value]) => {
+    if (value === null) return key === "store" ? "店を未設定" : "内容を未設定";
+    if (key === "amount") return `${Number(value).toLocaleString("ja-JP")}円`;
+    if (key === "spent_at") return `日付は${String(value)}`;
+    return String(value);
+  });
+  return `${changed.join("、") || "内容"}ですね。直しました。`;
+}
+
+async function patchDiscordMessage(env: Env, channelId: string, messageId: string, data: Record<string, unknown>): Promise<boolean> {
+  try {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(data)
+    });
+    if (response.ok) return true;
+    console.error(`Discord expense card patch error: ${response.status} ${await response.text()}`);
+  } catch (error) {
+    console.error("Discord expense card patch failed", error);
+  }
+  return false;
+}
+
+async function handleExpenseCorrection(env: Env, message: DiscordMessage, pending: PendingActionRow): Promise<void> {
+  if (pending.requested_by !== message.author.id) return;
+  const payload = expensePendingPayload(pending);
+  if (new Date(pending.expires_at).getTime() < Date.now()) {
+    await env.DB.prepare("DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?")
+      .bind(pending.id, pending.requested_by)
+      .run();
+    await postDiscordReply(env, message.channel_id, message.id, "その候補は期限切れか処理済みです。もう一度教えてください。");
+    return;
+  }
+
+  let correction = parseExpenseCorrection(message.content, EXPENSE_CATEGORIES);
+  if (!correctionFieldEntries(correction).length) {
+    correction = await parseExpenseCorrectionWithAi(env, message.content, payload);
+  }
+  const entries = correctionFieldEntries(correction);
+  if (!entries.length) {
+    await postDiscordReply(env, message.channel_id, message.id, "どこを直すか読み取れませんでした。大分類・品物・店・金額のどれかを教えてください。");
+    return;
+  }
+
+  let expression = "payload";
+  const bindings: (string | number | null)[] = [];
+  for (const [key, value] of entries) {
+    expression = `json_set(${expression}, '$.${key}', ?)`;
+    bindings.push(value);
+  }
+  const updated = await env.DB.prepare(
+    `UPDATE pending_actions SET payload = ${expression}
+     WHERE id = ? AND kind = 'expense' AND requested_by = ?`
+  ).bind(...bindings, pending.id, pending.requested_by).run();
+  if (!updated.meta.changes) {
+    await postDiscordReply(env, message.channel_id, message.id, "その候補は期限切れか処理済みです。もう一度教えてください。");
+    return;
+  }
+
+  const latest = await env.DB.prepare(
+    "SELECT id, kind, payload, requested_by, channel_id, expires_at, message_id FROM pending_actions WHERE id = ? AND kind = 'expense'"
+  ).bind(pending.id).first<PendingActionRow>();
+  if (!latest) {
+    await postDiscordReply(env, message.channel_id, message.id, "その候補は期限切れか処理済みです。もう一度教えてください。");
+    return;
+  }
+  const latestPayload = expensePendingPayload(latest);
+  const cardMessageId = latest.message_id ?? messageReferenceId(message);
+  const cardUpdated = cardMessageId
+    ? await patchDiscordMessage(env, message.channel_id, cardMessageId, {
+      content: fitDiscordContent([pendingContent("expense", latestPayload)], 1900),
+      components: pendingExpenseComponents(latest.id, latestPayload)
+    })
+    : false;
+  const response = cardUpdated
+    ? expenseCorrectionReply(correction)
+    : `${expenseCorrectionReply(correction)} 保存はしましたがカードの表示更新に失敗しました。記録するを押すと保存内容で記録されます。`;
+  await postDiscordReply(env, message.channel_id, message.id, response);
+}
+
 async function handleChatMessage(env: Env, message: DiscordMessage): Promise<void> {
   const text = message.content.trim();
   if (!text) return;
 
   const replyChain = await buildReplyChain(env, message);
+  const correctionHandled = await handleExpenseCorrectionEntry(env, message, text);
+  if (correctionHandled) return;
   if (isHiddenAdultPrankTrigger(chatGuardText(text, replyChain))) {
     await postDiscordReply(env, message.channel_id, message.id, randomItem(YUUKA_PHRASES.hiddenAdultPranks));
     return;
@@ -1322,10 +1661,13 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
       continue;
     }
 
-    if (event.type === "expense_candidate" && event.amount && event.content) {
+    if (event.type === "expense_candidate" && event.amount && (event.item ?? event.content)) {
       const amount = Math.round(Number(event.amount));
-      const memo = normalizeExpenseMemo(event.content, event.category ?? null);
-      const aside = await expenseAiComment(env, amount, event.category ?? null, memo);
+      const category = normalizeExpenseCategory(event.category, EXPENSE_CATEGORIES);
+      const item = String(event.item ?? event.content).trim();
+      const memo = normalizeExpenseMemo(item, category);
+      const store = stringOrNull(event.store);
+      const aside = await expenseAiComment(env, amount, category, memo, store);
       await createPendingPost(
         env,
         message.channel_id,
@@ -1333,14 +1675,17 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
         "expense",
         {
           amount,
-          category: event.category ?? null,
+          category,
+          item,
           memo,
+          store,
+          ai_comment: aside,
           spent_at: event.datetime ?? new Date().toISOString()
         },
         [
           aside,
           "支出候補を検出しました。",
-          formatExpenseCandidate(amount, event.category ?? null, memo)
+          formatExpenseCandidate(amount, category, memo, store, event.datetime ?? new Date().toISOString())
         ].filter(Boolean).join("\n"),
         message.id
       );
@@ -1352,6 +1697,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
       const expenseContext = shouldIncludeExpenseContext(text) ? await buildExpenseContext(env) : "";
       const answer = replyChain.length ? await chatReplyWithContext(env, text, replyChain, expenseContext) : event.reply && !expenseContext ? event.reply : await geminiText(env, [
         personaPrompt(persona),
+        manualPrompt(),
         "Discordの雑談ルームで、先生に短く自然に返答してください。タスク登録は自動で確定しない。1〜3文。",
         "ユーザーが求めていない限り、雑談を打ち切ったり、別行動へ誘導したりしないでください。",
         expenseContext ? "先生は支出・浪費・予算について話しています。支出状況を踏まえて、会計担当として自然に返してください。数字は支出状況にあるものだけ使い、捏造しないでください。" : "",
@@ -1496,13 +1842,18 @@ function formatReplyChain(replyChain: ReplyContext[]): string {
 async function classifyChatEvents(env: Env, text: string, replyChain: ReplyContext[] = []): Promise<ChatEvent[]> {
   const openTodos = await listTodos(env, "all");
   const openReminders = await listReminders(env);
+  const expenseHistory = await buildExpenseCategoryHistory(env);
   const prompt = [
+    manualPrompt(),
+    "大分類一覧: " + EXPENSE_CATEGORIES.join("|"),
+    "直近の支出から作った分類履歴（JSON 1行・最大15組）:\n" + expenseHistory,
     "Discordの雑談発言から、複数のイベントを抽出し、JSONだけで返してください。",
     "1つの発言に雑談、todo、リマインダー、完了報告が混ざる場合は、それぞれ別イベントにしてください。",
     "typeは chat_reply/todo_candidate/reminder_candidate/reminder_delete_candidate/done_candidate/expense_candidate/none のどれか。",
     "明確に予定・時刻・リマインド依頼ならreminder_candidate。リマインダーを消す/削除する/いらないという依頼ならreminder_delete_candidate。やること・締切・todo依頼ならtodo_candidate。完了報告ならdone_candidate。支払い・購入・課金・浪費・金額の記録ならexpense_candidate。感情ケアや普通の会話で返答した方がよければchat_reply。",
     "介入不要なら [{\"type\":\"none\"}]。",
-    "出力形式: {\"events\":[{\"type\":\"chat_reply|todo_candidate|reminder_candidate|reminder_delete_candidate|done_candidate|expense_candidate|none\",\"content\":\"...\",\"datetime\":\"YYYY-MM-DDTHH:mm:ss+09:00 または null\",\"recurrence_rule\":null または {\"type\":\"daily|weekly|monthly\",\"interval\":1,\"weekdays\":[1],\"month_days\":[1],\"time\":\"09:00\",\"timezone\":\"Asia/Tokyo\"},\"recurrence_label\":\"毎週月曜\" または null,\"todo_id\":数値またはnull,\"reminder_id\":数値またはnull,\"amount\":金額数値またはnull,\"category\":\"食費|交通|書籍|ゲーム|サブスク|日用品|交際費|趣味|医療|住居|その他 など\",\"confidence\":\"high|medium|low\",\"reply\":\"...\"}]}",
+    "expense_candidateではitemに品物、storeに店を入れ、categoryは大分類一覧から1つだけ選んでください。contentは従来形式のフォールバックとして残しても構いません。",
+    "出力形式: {\"events\":[{\"type\":\"chat_reply|todo_candidate|reminder_candidate|reminder_delete_candidate|done_candidate|expense_candidate|none\",\"content\":\"...\",\"item\":\"品物\",\"store\":\"店\",\"datetime\":\"YYYY-MM-DDTHH:mm:ss+09:00 または null\",\"recurrence_rule\":null または {\"type\":\"daily|weekly|monthly\",\"interval\":1,\"weekdays\":[1],\"month_days\":[1],\"time\":\"09:00\",\"timezone\":\"Asia/Tokyo\"},\"recurrence_label\":\"毎週月曜\" または null,\"todo_id\":数値またはnull,\"reminder_id\":数値またはnull,\"amount\":金額数値またはnull,\"category\":\"大分類一覧のいずれか\",\"confidence\":\"high|medium|low\",\"reply\":\"...\"}]}",
     "chat_replyのreplyはユウカとして1〜3文。todo/reminder/doneの事実は変えない。",
     "雑談では、ユーザーが求めていない限り会話を打ち切ったり、別行動へ誘導したりしない。照れ隠しは会話の返答として自然な範囲に留める。",
     "reminder_delete_candidateは未通知リマインダー一覧から最も近いものを選び、確信できる場合はreminder_idを入れてください。曖昧ならcontentだけ入れてreminder_idはnull。",
@@ -1522,16 +1873,26 @@ async function classifyChatEvents(env: Env, text: string, replyChain: ReplyConte
     const raw = await geminiText(env, prompt);
     const jsonText = raw.match(/\{[\s\S]*\}/)?.[0] ?? "{}";
     const parsed = JSON.parse(jsonText) as { events?: ChatEvent[] };
-    const events = Array.isArray(parsed.events) && parsed.events.length ? parsed.events : [{ type: "none" } as ChatEvent];
-    return events.map((event) => {
-      if (event.type !== "reminder_candidate") return event;
-      const recurrence = normalizeRecurrenceRule(event.recurrence_rule ?? null, event.datetime ?? null, env.TIMEZONE ?? "Asia/Tokyo");
+    let events = Array.isArray(parsed.events) && parsed.events.length ? parsed.events : [{ type: "none" } as ChatEvent];
+    events = events.map((event) => {
+      const recurrence = event.type === "reminder_candidate"
+        ? normalizeRecurrenceRule(event.recurrence_rule ?? null, event.datetime ?? null, env.TIMEZONE ?? "Asia/Tokyo")
+        : null;
+      const item = event.item ?? (event.type === "expense_candidate" ? event.content ?? null : null);
       return {
         ...event,
-        recurrence_rule: recurrence,
-        recurrence_label: event.recurrence_label ?? recurrenceLabel(recurrence)
+        item,
+        category: event.type === "expense_candidate" ? normalizeExpenseCategory(event.category, EXPENSE_CATEGORIES) : event.category,
+        recurrence_rule: event.type === "reminder_candidate" ? recurrence : event.recurrence_rule,
+        recurrence_label: event.type === "reminder_candidate" ? event.recurrence_label ?? recurrenceLabel(recurrence) : event.recurrence_label
       };
     });
+    const expenseEvents = events.filter((event) => event.type === "expense_candidate");
+    const designation = findCategoryDesignation(text, EXPENSE_CATEGORIES);
+    if (designation && expenseEvents.length === 1) {
+      events = events.map((event) => event.type === "expense_candidate" ? { ...event, category: designation } : event);
+    }
+    return events;
   } catch (error) {
     console.error("chat event classification failed", error);
     if (isGeminiUnavailableError(error)) throw error;
@@ -1560,6 +1921,7 @@ async function chatReplyWithContext(env: Env, text: string, replyChain: ReplyCon
     const persona = await loadPersona(env);
     return await geminiText(env, [
       personaPrompt(persona),
+      manualPrompt(),
       "Discordの雑談ルームで、先生への返信を書いてください。",
       "先生はリプライ会話の続きとして発言しています。会話の始まりから直近までを文脈として扱い、自然に返してください。",
       "支出・浪費の話題なら、会計担当として呆れたり叱ったりしてよい。ただし先生を突き放さず、最後は次の一歩やフォローにつなげる。",
@@ -1580,7 +1942,7 @@ async function chatReplyWithContext(env: Env, text: string, replyChain: ReplyCon
   }
 }
 
-async function expenseAiComment(env: Env, amount: number, category: string | null, memo: string): Promise<string> {
+async function expenseAiComment(env: Env, amount: number, category: string | null, memo: string, store: string | null): Promise<string> {
   try {
     const persona = await loadPersona(env);
     const tone = amount >= 30000
@@ -1594,12 +1956,13 @@ async function expenseAiComment(env: Env, amount: number, category: string | nul
       personaPrompt(persona),
       "Discordで支出・浪費メモ候補を出す直前に、早瀬ユウカとしてコメントしてください。",
       "会計担当らしく、金額を見て少し呆れたり叱ったり、必要なら机を叩くような勢いを出してよいです。",
-      "ただし長説教にしない。支出候補の定型文の前に置く文章なので、1〜3文。金額・カテゴリ・メモの事実は変えない。",
+      "ただし長説教にしない。支出候補の定型文の前に置く文章なので、1〜3文。金額・大分類・品物・店の事実は変えない。",
       "最後は記録確認につながる言い方にしてください。箇条書きは禁止。",
       `トーン: ${tone}`,
       `金額: ${amount}円`,
-      `カテゴリ: ${category ?? "その他"}`,
-      `メモ: ${memo}`
+      `大分類: ${category ?? "その他"}`,
+      `品物: ${memo}`,
+      `店: ${store ?? "未設定"}`
     ].join("\n\n"), 0.9);
     return answer.split("\n").map((line) => line.trim()).filter(Boolean).join("\n").slice(0, 260);
   } catch (error) {
@@ -1631,8 +1994,10 @@ function chatGuardText(text: string, replyChain: ReplyContext[]): string {
 function pendingPayloadText(payload: Record<string, string | number | null>, extra = ""): string {
   return [
     payload.content,
+    payload.item,
     payload.memo,
     payload.category,
+    payload.store,
     payload.confirmation_base_content,
     extra
   ].filter((value): value is string | number => value !== null && value !== undefined).map(String).join("\n");
@@ -1644,6 +2009,29 @@ function randomItem<T>(items: readonly T[]): T {
   return items[array[0] % items.length];
 }
 
+function truncateExpenseText(value: unknown, max: number): string {
+  const text = String(value ?? "").trim();
+  const characters = [...text];
+  return characters.length > max ? `${characters.slice(0, Math.max(0, max - 1)).join("")}…` : text;
+}
+
+async function buildExpenseCategoryHistory(env: Env): Promise<string> {
+  const recent = await listExpenses(env, "all");
+  const seen = new Set<string>();
+  const history: { item: string; store: string | null; category: string }[] = [];
+  for (const expense of recent.slice(0, 30)) {
+    const item = truncateExpenseText(expense.memo, 20);
+    const store = expense.store ? truncateExpenseText(expense.store, 20) : null;
+    const category = normalizeExpenseCategory(expense.category, EXPENSE_CATEGORIES);
+    const key = JSON.stringify([item, store, category]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    history.push({ item, store, category });
+    if (history.length >= 15) break;
+  }
+  return JSON.stringify(history);
+}
+
 async function buildExpenseContext(env: Env): Promise<string> {
   const expenses = await listExpenses(env, "month");
   const total = expenses.reduce((sum, row) => sum + row.amount, 0);
@@ -1652,8 +2040,8 @@ async function buildExpenseContext(env: Env): Promise<string> {
   return [
     "支出状況（今月）",
     `合計: ${total.toLocaleString("ja-JP")}円`,
-    byCategory.length ? `カテゴリ別: ${byCategory.map((row) => `${row.category}:${row.total.toLocaleString("ja-JP")}円`).join(", ")}` : "カテゴリ別: なし",
-    recent.length ? `直近: ${recent.map((row) => `#${row.id} ${row.memo} ${row.amount.toLocaleString("ja-JP")}円`).join(", ")}` : "直近: なし"
+    byCategory.length ? `大分類別: ${byCategory.map((row) => `${row.category}:${row.total.toLocaleString("ja-JP")}円`).join(", ")}` : "大分類別: なし",
+    recent.length ? `直近: ${recent.map((row) => `#${row.id} ${row.memo}${row.store ? ` @ ${row.store}` : ""} ${row.amount.toLocaleString("ja-JP")}円`).join(", ")}` : "直近: なし"
   ].join("\n");
 }
 
@@ -1698,7 +2086,7 @@ async function fetchDiscordMessage(env: Env, channelId: string, messageId: strin
   }
 }
 
-async function postDiscordPayload(env: Env, channelId: string, payload: Record<string, unknown>): Promise<void> {
+async function postDiscordPayload(env: Env, channelId: string, payload: Record<string, unknown>): Promise<{ id: string } | null> {
   const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
     method: "POST",
     headers: {
@@ -1709,6 +2097,12 @@ async function postDiscordPayload(env: Env, channelId: string, payload: Record<s
   });
   if (!response.ok) {
     throw new Error(`Discord payload error: ${response.status} ${await response.text()}`);
+  }
+  try {
+    const posted = await response.json<{ id?: string }>();
+    return posted.id ? { id: posted.id } : null;
+  } catch {
+    return null;
   }
 }
 
@@ -2150,7 +2544,7 @@ async function maybeSendMonthlyExpenseReport(env: Env): Promise<void> {
   const start = `${monthKey}-01T00:00:00+09:00`;
   const end = `${monthKey}-${pad(parts.day)}T23:59:59+09:00`;
   const rows = await env.DB.prepare(
-    `SELECT id, amount, category, memo, spent_at, created_at
+    `SELECT id, amount, category, memo, store, spent_at, created_at
      FROM expenses
      WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)
      ORDER BY datetime(spent_at) ASC`
@@ -2159,13 +2553,11 @@ async function maybeSendMonthlyExpenseReport(env: Env): Promise<void> {
   const total = expenses.reduce((sum, row) => sum + row.amount, 0);
   const byCategory = summarizeExpensesByCategory(expenses);
   const ai = await monthlyExpenseAiComment(env, monthKey, total, byCategory, expenses.slice(-5));
-  const message = [
-    ai || `先生、${monthKey}の支出レポートです。消費は計画的に、ですよ。`,
-    "",
-    `合計: ${total.toLocaleString("ja-JP")}円`,
-    "",
-    byCategory.length ? ["カテゴリ別", ...byCategory.map((row) => `- ${row.category}: ${row.total.toLocaleString("ja-JP")}円`)].join("\n") : "記録された支出はありません。"
-  ].join("\n");
+  const hierarchy = buildExpenseHierarchyParts(expenses, EXPENSE_CATEGORIES, 5);
+  const message = fitDiscordContent({
+    header: [ai || `先生、${monthKey}の支出レポートです。消費は計画的に、ですよ。`, "", ...hierarchy.header, ...(expenses.length ? [] : ["記録された支出はありません。"])],
+    sections: hierarchy.sections
+  }, 1900);
   const channels = await loadChannels(env);
   await postDiscordMessage(env, channels.report, message);
   await markDailySummarySent(env, summaryKey);
@@ -2249,7 +2641,7 @@ async function buildBackupJson(env: Env, reason: "manual" | "monthly"): Promise<
 async function postDiscordFile(env: Env, channelId: string, filename: string, content: string, message: string): Promise<void> {
   const form = new FormData();
   form.append("payload_json", JSON.stringify({
-    content: message.slice(0, 1900),
+    content: fitDiscordContent(message.split("\n"), 1900),
     attachments: [{ id: 0, filename }]
   }));
   form.append("files[0]", new Blob([content], { type: "application/json" }), filename);
@@ -2317,12 +2709,12 @@ async function maybeSendWeeklyMutterResponse(env: Env): Promise<void> {
 function summarizeExpensesByCategory(expenses: ExpenseRow[]): { category: string; total: number }[] {
   const map = new Map<string, number>();
   for (const expense of expenses) {
-    const category = expense.category || "その他";
+    const category = normalizeExpenseCategory(expense.category, EXPENSE_CATEGORIES);
     map.set(category, (map.get(category) ?? 0) + expense.amount);
   }
-  return [...map.entries()]
-    .map(([category, total]) => ({ category, total }))
-    .sort((a, b) => b.total - a.total);
+  return EXPENSE_CATEGORIES
+    .filter((category) => map.has(category))
+    .map((category) => ({ category, total: map.get(category) ?? 0 }));
 }
 
 async function monthlyExpenseAiComment(env: Env, monthKey: string, total: number, byCategory: { category: string; total: number }[], recent: ExpenseRow[]): Promise<string> {
@@ -2333,8 +2725,8 @@ async function monthlyExpenseAiComment(env: Env, monthKey: string, total: number
       "月末昼の支出レポート冒頭をユウカとして3文以内で書いてください。会計担当らしく、少し小言を言ってもよいが、記録できたことは評価する。事実・金額は変えない。",
       `対象月: ${monthKey}`,
       `合計: ${total}円`,
-      `カテゴリ別: ${byCategory.map((row) => `${row.category}:${row.total}円`).join(", ") || "なし"}`,
-      `直近の支出: ${recent.map((row) => `${row.memo}:${row.amount}円`).join(", ") || "なし"}`
+      `大分類別: ${byCategory.map((row) => `${row.category}:${row.total}円`).join(", ") || "なし"}`,
+      `直近の支出: ${recent.map((row) => `${row.memo}${row.store ? ` @ ${row.store}` : ""}:${row.amount}円`).join(", ") || "なし"}`
     ].join("\n\n"), 0.85);
   } catch {
     return "";
@@ -2348,7 +2740,7 @@ async function postDiscordMessage(env: Env, channelId: string, content: string):
       Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ content: content.slice(0, 1900) })
+    body: JSON.stringify({ content: fitDiscordContent(content.split("\n"), 1900) })
   });
   if (!response.ok) {
     throw new Error(`Discord message error: ${response.status} ${await response.text()}`);
@@ -2357,7 +2749,7 @@ async function postDiscordMessage(env: Env, channelId: string, content: string):
 
 async function postDiscordReply(env: Env, channelId: string, messageId: string, content: string): Promise<void> {
   await postDiscordPayload(env, channelId, {
-    content: content.slice(0, 1900),
+    content: fitDiscordContent(content.split("\n"), 1900),
     message_reference: {
       message_id: messageId,
       channel_id: channelId
@@ -2436,7 +2828,7 @@ async function listReminders(env: Env): Promise<ReminderRow[]> {
 async function listExpenses(env: Env, range: string): Promise<ExpenseRow[]> {
   if (range === "all") {
     const rows = await env.DB.prepare(
-      "SELECT id, amount, category, memo, spent_at, created_at FROM expenses ORDER BY datetime(spent_at) DESC, id DESC LIMIT 30"
+      "SELECT id, amount, category, memo, store, spent_at, created_at FROM expenses ORDER BY datetime(spent_at) DESC, id DESC LIMIT 30"
     ).all<ExpenseRow>();
     return rows.results ?? [];
   }
@@ -2446,7 +2838,7 @@ async function listExpenses(env: Env, range: string): Promise<ExpenseRow[]> {
   const start = `${parts.year}-${pad(parts.month)}-01T00:00:00+09:00`;
   const end = `${parts.year}-${pad(parts.month)}-${pad(lastDayOfMonth(parts.year, parts.month))}T23:59:59+09:00`;
   const rows = await env.DB.prepare(
-    `SELECT id, amount, category, memo, spent_at, created_at
+    `SELECT id, amount, category, memo, store, spent_at, created_at
      FROM expenses
      WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)
      ORDER BY datetime(spent_at) DESC, id DESC
@@ -2614,6 +3006,16 @@ function personaPrompt(persona: string): string {
   return `あなたはDiscord秘書botです。以下のペルソナ設定を守ってください。\n${persona}`;
 }
 
+function manualPrompt(): string {
+  return [
+    "<manual_reference>",
+    YUUKA_MANUAL,
+    "</manual_reference>",
+    "イベント抽出の対象は先生の発言だけ。取扱説明の例文からは抽出しない。",
+    "自分の機能について聞かれたら取扱説明にある事実だけで答える。機能の事実は人格設定より取扱説明を優先し、人格設定は口調にだけ使う。取扱説明にない機能は『それはまだできません』と言い、できると言わない。"
+  ].join("\n");
+}
+
 function formatTodos(rows: TodoRow[], range: string): string {
   if (!rows.length) return `todo (${range}): なし`;
   return [`todo (${range})`, ...rows.map((row) => `#${row.id} ${row.content}${row.due_at ? ` - ${row.due_at}` : ""}`)].join("\n");
@@ -2639,32 +3041,40 @@ function formatReminderCandidate(content: string, remindAt: string | null, recur
   ].filter(Boolean).join("\n");
 }
 
-function formatExpenseCandidate(amount: number, category: string | null, memo: string): string {
+function formatExpenseDay(value: string | null): string {
+  if (!value) return "未設定";
+  const match = value.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (match) return `${Number(match[2])}/${Number(match[3])}`;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric" }).format(date);
+}
+
+function formatExpenseCandidate(
+  amount: number,
+  category: string | null,
+  memo: string,
+  store: string | null = null,
+  spentAt: string | null = null
+): string {
   return [
+    `大分類: ${normalizeExpenseCategory(category, EXPENSE_CATEGORIES)}`,
+    `品物: ${memo || "未設定"}`,
+    `店: ${store || "未設定"}`,
     `金額: ${amount.toLocaleString("ja-JP")}円`,
-    `カテゴリ: ${category ?? "その他"}`,
-    `メモ: ${memo}`
+    `日付: ${formatExpenseDay(spentAt)}`
   ].join("\n");
 }
 
 function formatExpenses(rows: ExpenseRow[], range: string, env: Env): string {
   const title = range === "all" ? "支出メモ (all / 直近10件)" : "支出メモ (今月 / 直近10件)";
   if (!rows.length) return `${title}: なし`;
-  const total = rows.reduce((sum, row) => sum + row.amount, 0);
-  const byCategory = summarizeExpensesByCategory(rows);
-  const details = rows.slice(0, 10).map((row) => {
-    const category = row.category || "その他";
-    return `#${row.id} ${formatDate(row.spent_at, env)} ${row.amount.toLocaleString("ja-JP")}円 / ${category} / ${row.memo}`;
-  });
-  return [
-    title,
-    `合計: ${total.toLocaleString("ja-JP")}円`,
-    "",
-    byCategory.length ? ["カテゴリ別", ...byCategory.map((row) => `- ${row.category}: ${row.total.toLocaleString("ja-JP")}円`)].join("\n") : "",
-    "",
-    "明細",
-    ...details
-  ].filter(Boolean).join("\n");
+  const visible = rows.slice(0, 10);
+  const hierarchy = buildExpenseHierarchyParts(visible, EXPENSE_CATEGORIES);
+  return fitDiscordContent({
+    header: [title, ...hierarchy.header],
+    sections: hierarchy.sections
+  }, 1900);
 }
 
 function normalizeExpenseMemo(content: string, category: string | null): string {
@@ -2752,8 +3162,33 @@ function formatPendingPreNotify(payload: Record<string, string | number | null>)
   return payload.pre_notify_pending ? "事前通知: 未設定" : formatPreNotify(payload.pre_notify_minutes);
 }
 
+function expensePendingAside(payload: Record<string, string | number | null>): string {
+  const saved = stringOrNull(payload.ai_comment);
+  if (saved) return saved;
+  const base = stringOrNull(payload.confirmation_base_content);
+  const marker = "支出候補を検出しました。";
+  if (base?.includes(marker)) return base.slice(0, base.indexOf(marker)).trim();
+  return "";
+}
+
+function formatExpensePendingContent(payload: Record<string, string | number | null>): string {
+  const spentAt = stringOrNull(payload.spent_at);
+  return fitDiscordContent([
+    expensePendingAside(payload),
+    "支出候補を検出しました。",
+    formatExpenseCandidate(
+      Math.max(0, Math.round(Number(payload.amount ?? 0))),
+      stringOrNull(payload.category),
+      String(payload.memo ?? payload.item ?? payload.content ?? ""),
+      stringOrNull(payload.store),
+      spentAt
+    )
+  ].filter(Boolean), 1900);
+}
+
 function pendingContent(kind: string, payload: Record<string, string | number | null>): string {
   const baseContent = typeof payload.confirmation_base_content === "string" ? payload.confirmation_base_content : "";
+  if (kind === "expense") return formatExpensePendingContent(payload);
   if ((kind === "todo" || kind === "reminder") && baseContent) {
     return `${baseContent}\n${formatPendingPreNotify(payload)}`;
   }
@@ -2763,9 +3198,6 @@ function pendingContent(kind: string, payload: Record<string, string | number | 
   }
   if (kind === "reminder") {
     return `この内容でリマインダーに登録しますか？\n${formatReminderCandidate(String(payload.content ?? ""), stringOrNull(payload.remind_at), stringOrNull(payload.recurrence_label))}\n${formatPendingPreNotify(payload)}`;
-  }
-  if (kind === "expense") {
-    return baseContent || pendingSummary(kind, payload);
   }
   return "この内容で登録しますか？";
 }
@@ -2807,7 +3239,9 @@ function pendingSummary(kind: string, payload: Record<string, string | number | 
       formatExpenseCandidate(
         Math.max(0, Math.round(Number(payload.amount ?? 0))),
         stringOrNull(payload.category),
-        String(payload.memo ?? payload.content ?? "")
+        String(payload.memo ?? payload.item ?? payload.content ?? ""),
+        stringOrNull(payload.store),
+        stringOrNull(payload.spent_at)
       )
     ].join("\n");
   }
@@ -2944,6 +3378,34 @@ function pendingComponents(id: string, options: { dueButton?: boolean; remindBut
     });
   }
   return rows;
+}
+
+function pendingExpenseComponents(id: string, payload: Record<string, string | number | null>): unknown[] {
+  const current = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORIES);
+  return [
+    {
+      type: 1,
+      components: [{
+        type: 3,
+        custom_id: `expense_cat:${id}`,
+        placeholder: `大分類: ${current}`,
+        min_values: 1,
+        max_values: 1,
+        options: EXPENSE_CATEGORIES.map((category) => ({
+          label: category,
+          value: category,
+          default: category === current
+        }))
+      }]
+    },
+    {
+      type: 1,
+      components: [
+        { type: 2, style: 3, label: "記録する", custom_id: `expense:${id}:ok` },
+        { type: 2, style: 4, label: "記録しない", custom_id: `expense:${id}:cancel` }
+      ]
+    }
+  ];
 }
 
 function reminderDueComponents(id: number): unknown[] {
@@ -3185,6 +3647,16 @@ function updateMessage(content: string): Response {
     data: {
       content,
       components: []
+    }
+  });
+}
+
+function updateMessageWithComponents(content: string, components: unknown[]): Response {
+  return json({
+    type: RESPONSE.UPDATE_MESSAGE,
+    data: {
+      content,
+      components
     }
   });
 }

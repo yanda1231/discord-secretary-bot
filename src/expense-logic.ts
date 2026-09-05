@@ -1,9 +1,9 @@
 export type ExpenseCorrection = {
-  category?: string;
-  memo?: string;
-  store?: string;
-  amount?: number;
-  spent_at?: string;
+  category?: string | null;
+  memo?: string | null;
+  store?: string | null;
+  amount?: number | null;
+  spent_at?: string | null;
 };
 
 export type CorrectionTargetInput = {
@@ -309,6 +309,8 @@ export function fitDiscordContent(parts: ExpenseContentParts | readonly string[]
   let structured: ExpenseContentParts;
   if (Array.isArray(parts)) {
     const lines = flattenLines(parts);
+    const original = lines.join("\n");
+    if (contentLength(original) <= limit) return original;
     const detailLines = lines.filter((line) => /^\s*-\s/.test(line) || /^\s*他\d+件/.test(line));
     const header = lines.filter((line) => !/^\s*-\s/.test(line) && !/^\s*他\d+件/.test(line));
     structured = detailLines.length ? { header, details: detailLines } : { header: lines };
