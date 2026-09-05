@@ -1,0 +1,371 @@
+export type ExpenseCorrection = {
+  category?: string;
+  memo?: string;
+  store?: string;
+  amount?: number;
+  spent_at?: string;
+};
+
+export type CorrectionTargetInput = {
+  isReply: boolean;
+  referencedPending: boolean;
+  referencedBotExpenseCard: boolean;
+  pendingCount: number;
+};
+
+export type CorrectionTargetDecision =
+  | "reply_match"
+  | "reply_expired_or_processed"
+  | "single_pending"
+  | "no_pending"
+  | "ambiguous";
+
+export type ExpenseLikeRow = {
+  id?: number;
+  amount: number;
+  category?: string | null;
+  memo: string;
+  store?: string | null;
+  spent_at: string;
+};
+
+export type ExpenseHierarchySection = {
+  category: string;
+  header: string;
+  details: string[];
+  overflow: number;
+};
+
+export type ExpenseContentParts = {
+  header: string[];
+  sections?: ExpenseHierarchySection[];
+  details?: string[];
+};
+
+const CATEGORY_DESIGNATION_SUFFIXES = ["で", "に", "として"] as const;
+const CORRECTION_CUE = /にして|に変えて|じゃなくて|直して|訂正|さっきの|間違い|違う|ちがう/;
+
+function normalizedCategoryEntries(categories: readonly string[]): { value: string; normalized: string }[] {
+  return categories
+    .map((category) => String(category).trim())
+    .filter(Boolean)
+    .map((value) => ({ value, normalized: value.normalize("NFKC") }))
+    .filter((entry, index, entries) => entries.findIndex((other) => other.normalized === entry.normalized) === index);
+}
+
+function categoryAlternation(categories: readonly string[]): string {
+  return normalizedCategoryEntries(categories)
+    .sort((a, b) => b.normalized.length - a.normalized.length)
+    .map((entry) => escapeRegExp(entry.normalized))
+    .join("|");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function categoryFromNormalized(value: string, categories: readonly string[]): string | null {
+  const normalized = value.normalize("NFKC").trim();
+  return normalizedCategoryEntries(categories).find((entry) => entry.normalized === normalized)?.value ?? null;
+}
+
+function categoryOccurrences(text: string, categories: readonly string[]): { category: string; index: number; suffix: string }[] {
+  const entries = normalizedCategoryEntries(categories).sort((a, b) => b.normalized.length - a.normalized.length);
+  const occurrences: { category: string; index: number; suffix: string }[] = [];
+  for (const entry of entries) {
+    let from = 0;
+    while (from < text.length) {
+      const index = text.indexOf(entry.normalized, from);
+      if (index < 0) break;
+      occurrences.push({ category: entry.value, index, suffix: text.slice(index + entry.normalized.length) });
+      from = index + entry.normalized.length;
+    }
+  }
+  return occurrences.sort((a, b) => a.index - b.index || b.category.length - a.category.length);
+}
+
+function isBlockedCategorySuffix(suffix: string): boolean {
+  return suffix.startsWith("の") || suffix.startsWith("解約");
+}
+
+function isDesignationSuffix(suffix: string): boolean {
+  return CATEGORY_DESIGNATION_SUFFIXES.some((candidate) => suffix.startsWith(candidate));
+}
+
+/** Find a category that the speaker explicitly used as a classification. */
+export function findCategoryDesignation(text: string, categories: readonly string[]): string | null {
+  const normalized = text.normalize("NFKC");
+  const alternation = categoryAlternation(categories);
+  if (!alternation) return null;
+
+  const candidates: { category: string; index: number }[] = [];
+  const labeled = new RegExp(`(?:カテゴリ|大分類)\\s*(?:は|を|=|:)\\s*(${alternation})`, "g");
+  for (const match of normalized.matchAll(labeled)) {
+    const category = categoryFromNormalized(match[1] ?? "", categories);
+    if (category && match.index !== undefined) {
+      candidates.push({ category, index: match.index });
+    }
+  }
+
+  const imperative = new RegExp(`(${alternation})(?:に分類|にして)`, "g");
+  for (const match of normalized.matchAll(imperative)) {
+    const category = categoryFromNormalized(match[1] ?? "", categories);
+    if (category && match.index !== undefined) {
+      candidates.push({ category, index: match.index });
+    }
+  }
+
+  const segmentPattern = /[^、。，,・\s]+/g;
+  for (const segmentMatch of normalized.matchAll(segmentPattern)) {
+    const segment = segmentMatch[0] ?? "";
+    const segmentStart = segmentMatch.index ?? 0;
+    const occurrences = categoryOccurrences(segment, categories);
+    const designated = occurrences.filter((occurrence) => isDesignationSuffix(occurrence.suffix));
+    if (!designated.length) continue;
+
+    const first = occurrences[0];
+    const selected = first && !isBlockedCategorySuffix(first.suffix) ? first : designated[0];
+    if (selected) candidates.push({ category: selected.category, index: segmentStart + selected.index });
+  }
+
+  candidates.sort((a, b) => a.index - b.index);
+  return candidates[0]?.category ?? null;
+}
+
+/** Normalize every category crossing the application boundary to the fixed list. */
+export function normalizeExpenseCategory(value: unknown, categories: readonly string[]): string {
+  const entries = normalizedCategoryEntries(categories);
+  const normalized = typeof value === "string" ? value.normalize("NFKC").trim() : "";
+  return entries.find((entry) => entry.normalized === normalized)?.value
+    ?? entries.find((entry) => entry.normalized === "その他")?.value
+    ?? "その他";
+}
+
+function cleanCorrectionValue(value: string): string {
+  return value
+    .trim()
+    .replace(/^[：:＝=\s]+/, "")
+    .replace(/[、。，,・]+$/, "")
+    .trim();
+}
+
+function correctionField(text: string, pattern: RegExp): string | undefined {
+  const match = text.match(pattern);
+  const value = match?.[1] ? cleanCorrectionValue(match[1]) : "";
+  return value || undefined;
+}
+
+/** Parse the unambiguous parts of an expense correction without calling an AI. */
+export function parseExpenseCorrection(text: string, categories: readonly string[]): ExpenseCorrection {
+  const normalized = text.normalize("NFKC").trim();
+  if (!normalized) return {};
+
+  const correction: ExpenseCorrection = {};
+  const category = findCategoryDesignation(normalized, categories);
+  if (category) correction.category = category;
+
+  const memo = correctionField(normalized, /(?:品物|商品|小分類)\s*(?:は|を|=|:)\s*([^、。，,・]+)/);
+  if (memo) correction.memo = memo;
+
+  const explicitStore = correctionField(normalized, /(?:店|店舗)\s*(?:は|を|=|:)\s*([^、。，,・]+)/);
+  if (explicitStore) {
+    correction.store = explicitStore;
+  } else {
+    const purchaseStore = correctionField(normalized, /(?:^|[、。，,・\s])([^、。，,・\s]+?)\s*で(?:買った|購入した|購入|買い)/);
+    const atStore = correctionField(normalized, /(?:^|[、。，,・\s])([^、。，,・\s]+?)\s*にて/);
+    const inferredStore = purchaseStore ?? atStore;
+    if (inferredStore && !categoryFromNormalized(inferredStore, categories)) {
+      correction.store = inferredStore;
+    }
+  }
+
+  const amount = normalized.match(/(?:¥|￥)?\s*(\d[\d,]*)\s*円/);
+  if (amount?.[1]) {
+    const parsedAmount = Number(amount[1].replace(/,/g, ""));
+    if (Number.isSafeInteger(parsedAmount) && parsedAmount > 0) correction.amount = parsedAmount;
+  }
+
+  return correction;
+}
+
+export function hasCorrectionCue(text: string): boolean {
+  return CORRECTION_CUE.test(text.normalize("NFKC"));
+}
+
+/** Resolve the five deterministic target branches before any classification AI call. */
+export function resolveCorrectionTarget(input: CorrectionTargetInput): CorrectionTargetDecision {
+  if (input.isReply && input.referencedPending) return "reply_match";
+  if (input.isReply && input.referencedBotExpenseCard) return "reply_expired_or_processed";
+  if (!input.isReply && input.pendingCount === 1) return "single_pending";
+  if (!input.isReply && input.pendingCount > 1) return "ambiguous";
+  return "no_pending";
+}
+
+function truncateDisplay(value: unknown, max = 40): string {
+  const text = String(value ?? "").trim() || "支出";
+  const characters = [...text];
+  return characters.length > max ? `${characters.slice(0, Math.max(0, max - 1)).join("")}…` : text;
+}
+
+function formatExpenseDay(value: string): string {
+  const match = value.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (match) return `${Number(match[2])}/${Number(match[3])}`;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric" }).format(date);
+}
+
+function expenseDetail(row: ExpenseLikeRow, category: string): string {
+  const memo = truncateDisplay(row.memo, 40);
+  const store = row.store ? ` @ ${truncateDisplay(row.store, 40)}` : "";
+  return `  - ${formatExpenseDay(row.spent_at)} ${memo}${store} ${Number(row.amount).toLocaleString("ja-JP")}円`;
+}
+
+function groupedExpenses(rows: readonly ExpenseLikeRow[], categories: readonly string[]): { category: string; rows: ExpenseLikeRow[] }[] {
+  const groups = new Map<string, ExpenseLikeRow[]>();
+  for (const row of rows) {
+    const category = normalizeExpenseCategory(row.category, categories);
+    const group = groups.get(category) ?? [];
+    group.push(row);
+    groups.set(category, group);
+  }
+  const entries = normalizedCategoryEntries(categories);
+  return entries
+    .map((entry) => ({ category: entry.value, rows: groups.get(entry.value) ?? [] }))
+    .filter((group) => group.rows.length > 0);
+}
+
+export function buildExpenseHierarchyParts(
+  rows: readonly ExpenseLikeRow[],
+  categories: readonly string[],
+  perCategoryLimit?: number
+): ExpenseContentParts {
+  const total = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const sections = groupedExpenses(rows, categories).map(({ category, rows: categoryRows }) => {
+    const limit = perCategoryLimit === undefined ? categoryRows.length : Math.max(0, perCategoryLimit);
+    const details = categoryRows.slice(0, limit).map((row) => expenseDetail(row, category));
+    return {
+      category,
+      header: `■ ${category} ${categoryRows.reduce((sum, row) => sum + Number(row.amount || 0), 0).toLocaleString("ja-JP")}円`,
+      details,
+      overflow: Math.max(0, categoryRows.length - details.length)
+    };
+  });
+  return {
+    header: [`合計: ${total.toLocaleString("ja-JP")}円`],
+    sections
+  };
+}
+
+export function formatExpenseHierarchy(rows: readonly ExpenseLikeRow[], categories: readonly string[]): string {
+  const parts = buildExpenseHierarchyParts(rows, categories);
+  const lines = [...parts.header];
+  for (const section of parts.sections ?? []) {
+    lines.push(section.header, ...section.details);
+    if (section.overflow > 0) lines.push(`  - 他${section.overflow}件`);
+  }
+  return lines.join("\n");
+}
+
+function flattenLines(values: readonly string[] | undefined): string[] {
+  return (values ?? []).flatMap((value) => String(value).split("\n")).filter((line) => line.length > 0);
+}
+
+function contentLength(value: string): number {
+  return [...value].length;
+}
+
+function renderContentParts(
+  parts: ExpenseContentParts,
+  selectedDetails: Set<string>,
+  selectedOverflow: Set<number>,
+  globalOverflow: number
+): string {
+  const lines = [...flattenLines(parts.header)];
+  let sectionIndex = 0;
+  for (const section of parts.sections ?? []) {
+    lines.push(section.header);
+    section.details.forEach((detail, detailIndex) => {
+      const key = `${sectionIndex}:${detailIndex}`;
+      if (selectedDetails.has(key)) lines.push(detail);
+    });
+    if (section.overflow > 0 && selectedOverflow.has(sectionIndex)) {
+      lines.push(`  - 他${section.overflow}件`);
+    }
+    sectionIndex += 1;
+  }
+  lines.push(...flattenLines(parts.details).filter((detail, index) => selectedDetails.has(`top:${index}`)));
+  if (globalOverflow > 0) lines.push(`  - 他${globalOverflow}件`);
+  return lines.join("\n");
+}
+
+/**
+ * Fit Discord content at line boundaries while retaining every fixed header and
+ * category subtotal. The object form is used by expense reports; the array form
+ * keeps the helper convenient for ordinary fixed-content messages and tests.
+ */
+export function fitDiscordContent(parts: ExpenseContentParts | readonly string[], max = 1900): string {
+  const limit = Math.max(1, Math.floor(max));
+  let structured: ExpenseContentParts;
+  if (Array.isArray(parts)) {
+    const lines = flattenLines(parts);
+    const detailLines = lines.filter((line) => /^\s*-\s/.test(line) || /^\s*他\d+件/.test(line));
+    const header = lines.filter((line) => !/^\s*-\s/.test(line) && !/^\s*他\d+件/.test(line));
+    structured = detailLines.length ? { header, details: detailLines } : { header: lines };
+  } else {
+    structured = parts as ExpenseContentParts;
+  }
+
+  const selectedDetails = new Set<string>();
+  const selectedOverflow = new Set<number>();
+  const candidates: { key: string; overflow: boolean; index: number; count: number }[] = [];
+  let detailCount = 0;
+  (structured.sections ?? []).forEach((section, sectionIndex) => {
+    section.details.forEach((_, detailIndex) => {
+      candidates.push({ key: `${sectionIndex}:${detailIndex}`, overflow: false, index: detailCount, count: 1 });
+      detailCount += 1;
+    });
+    if (section.overflow > 0) {
+      candidates.push({ key: `overflow:${sectionIndex}`, overflow: true, index: detailCount, count: section.overflow });
+      detailCount += section.overflow;
+    }
+  });
+  (structured.details ?? []).forEach((_, detailIndex) => {
+    candidates.push({ key: `top:${detailIndex}`, overflow: false, index: detailCount, count: 1 });
+    detailCount += 1;
+  });
+
+  const renderCandidate = (candidate: { key: string; overflow: boolean; index: number; count: number }, globalOverflow: number): string => {
+    if (candidate.overflow) selectedOverflow.add(Number(candidate.key.split(":")[1]));
+    else selectedDetails.add(candidate.key);
+    const output = renderContentParts(structured, selectedDetails, selectedOverflow, globalOverflow);
+    if (contentLength(output) <= limit) return output;
+    if (candidate.overflow) selectedOverflow.delete(Number(candidate.key.split(":")[1]));
+    else selectedDetails.delete(candidate.key);
+    return "";
+  };
+
+  let omitted = detailCount;
+  for (const candidate of candidates) {
+    const remainingAfter = omitted - candidate.count;
+    const globalOverflow = remainingAfter > 0 ? remainingAfter : 0;
+    const output = renderCandidate(candidate, globalOverflow);
+    if (!output) break;
+    omitted = remainingAfter;
+  }
+
+  let output = renderContentParts(structured, selectedDetails, selectedOverflow, omitted);
+  if (contentLength(output) <= limit) return output;
+
+  // A normal expense header is well below Discord's limit. If a caller supplies
+  // an unusually long fixed line, retain complete lines rather than cutting text.
+  const lines = output.split("\n");
+  const kept: string[] = [];
+  for (const line of lines) {
+    const candidate = [...kept, line].join("\n");
+    if (contentLength(candidate) > limit) break;
+    kept.push(line);
+  }
+  output = kept.join("\n");
+  return output;
+}
