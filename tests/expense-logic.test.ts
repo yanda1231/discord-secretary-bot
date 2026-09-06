@@ -68,6 +68,37 @@ test("大分類順の階層表示と一覧外の集約", () => {
   assert.ok(output.indexOf("■ 雑費") < output.indexOf("■ その他"));
 });
 
+test("一覧は明細10件、合計と小計は範囲全体", () => {
+  const allRows = [
+    ...Array.from({ length: 10 }, (_, index) => ({
+      id: index + 1,
+      amount: 100,
+      category: "食費",
+      memo: `食費${index}`,
+      store: null,
+      spent_at: "2026-09-05T12:00:00+09:00"
+    })),
+    { id: 11, amount: 500, category: "雑費", memo: "範囲全体の雑費", store: null, spent_at: "2026-09-04T12:00:00+09:00" },
+    { id: 12, amount: 700, category: "ゲーム", memo: "範囲全体の一覧外", store: null, spent_at: "2026-09-03T12:00:00+09:00" }
+  ];
+  const visibleRows = allRows.slice(0, 10);
+  const parts = buildExpenseHierarchyParts(visibleRows, categories, undefined, {
+    total: 2_200,
+    byCategory: [
+      { category: "食費", total: 1_000 },
+      { category: "雑費", total: 500 },
+      { category: "ゲーム", total: 700 }
+    ]
+  });
+  const output = fitDiscordContent(parts, 1900);
+  assert.match(output, /合計: 2,200円/);
+  assert.match(output, /■ 食費 1,000円/);
+  assert.match(output, /■ 雑費 500円/);
+  assert.match(output, /■ その他 700円/);
+  assert.equal(output.split("\n").filter((line) => line.startsWith("  - ")).length, 10);
+  assert.doesNotMatch(output, /範囲全体の雑費|範囲全体の一覧外/);
+});
+
 test("Discord文字数境界は明細を行単位で省略する", () => {
   const rows = Array.from({ length: 40 }, (_, index) => ({
     id: index + 1,

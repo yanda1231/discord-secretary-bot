@@ -42,6 +42,16 @@ export type ExpenseContentParts = {
   details?: string[];
 };
 
+export type ExpenseCategoryTotal = {
+  category: string;
+  total: number;
+};
+
+export type ExpenseSummary = {
+  total: number;
+  byCategory: readonly ExpenseCategoryTotal[];
+};
+
 const CATEGORY_DESIGNATION_SUFFIXES = ["で", "に", "として"] as const;
 const CORRECTION_CUE = /にして|に変えて|じゃなくて|直して|訂正|さっきの|間違い|違う|ちがう/;
 
@@ -238,15 +248,31 @@ function groupedExpenses(rows: readonly ExpenseLikeRow[], categories: readonly s
 export function buildExpenseHierarchyParts(
   rows: readonly ExpenseLikeRow[],
   categories: readonly string[],
-  perCategoryLimit?: number
+  perCategoryLimit?: number,
+  summary?: ExpenseSummary
 ): ExpenseContentParts {
-  const total = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-  const sections = groupedExpenses(rows, categories).map(({ category, rows: categoryRows }) => {
+  const total = summary?.total ?? rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const summaryTotals = new Map<string, number>();
+  for (const entry of summary?.byCategory ?? []) {
+    const category = normalizeExpenseCategory(entry.category, categories);
+    summaryTotals.set(category, (summaryTotals.get(category) ?? 0) + Number(entry.total || 0));
+  }
+  const grouped = new Map(groupedExpenses(rows, categories).map((group) => [group.category, group.rows]));
+  const sections = normalizedCategoryEntries(categories)
+    .map(({ value: category }) => ({
+      category,
+      rows: grouped.get(category) ?? [],
+      subtotal: summaryTotals.has(category)
+        ? summaryTotals.get(category) ?? 0
+        : (grouped.get(category) ?? []).reduce((sum, row) => sum + Number(row.amount || 0), 0)
+    }))
+    .filter((group) => group.rows.length > 0 || summaryTotals.has(group.category))
+    .map(({ category, rows: categoryRows, subtotal }) => {
     const limit = perCategoryLimit === undefined ? categoryRows.length : Math.max(0, perCategoryLimit);
     const details = categoryRows.slice(0, limit).map((row) => expenseDetail(row, category));
     return {
       category,
-      header: `■ ${category} ${categoryRows.reduce((sum, row) => sum + Number(row.amount || 0), 0).toLocaleString("ja-JP")}円`,
+      header: `■ ${category} ${subtotal.toLocaleString("ja-JP")}円`,
       details,
       overflow: Math.max(0, categoryRows.length - details.length)
     };

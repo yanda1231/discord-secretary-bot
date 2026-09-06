@@ -9,7 +9,8 @@ import {
   parseExpenseCorrection,
   resolveCorrectionTarget,
   type CorrectionTargetDecision,
-  type ExpenseCorrection
+  type ExpenseCorrection,
+  type ExpenseSummary
 } from "./expense-logic";
 import { YUUKA_MANUAL } from "./yuuka-manual";
 import expenseCategories from "./expense-categories.json";
@@ -363,8 +364,11 @@ async function handleExpenseCommand(interaction: DiscordInteraction, env: Env): 
 
   if (sub.name === "list") {
     const range = getString(sub, "range") ?? "all";
-    const rows = await listExpenses(env, range);
-    return expenseListWithDeleteButtons(rows, range, env);
+    const [rows, summary] = await Promise.all([
+      listExpenses(env, range),
+      summarizeExpenseRange(env, range)
+    ]);
+    return expenseListWithDeleteButtons(rows, range, env, summary);
   }
 
   return reply("未対応のexpenseサブコマンドです。", true);
@@ -1077,8 +1081,8 @@ function reminderListWithDeleteButtons(reminders: ReminderRow[]): Response {
   });
 }
 
-function expenseListWithDeleteButtons(expenses: ExpenseRow[], range: string, env: Env): Response {
-  if (!expenses.length) return reply(formatExpenses(expenses, range, env), true);
+function expenseListWithDeleteButtons(expenses: ExpenseRow[], range: string, env: Env, summary: ExpenseSummary): Response {
+  if (!expenses.length) return reply(formatExpenses(expenses, range, env, summary), true);
   const targets = expenses.slice(0, 10);
   const rows = [];
   for (let i = 0; i < targets.length; i += 5) {
@@ -1096,7 +1100,7 @@ function expenseListWithDeleteButtons(expenses: ExpenseRow[], range: string, env
     type: RESPONSE.CHANNEL_MESSAGE_WITH_SOURCE,
     data: {
       content: fitDiscordContent([
-        formatExpenses(expenses, range, env),
+        formatExpenses(expenses, range, env, summary),
         "",
         "間違って登録した支出メモは下のボタンで削除できます。"
       ], 1900),
@@ -2034,9 +2038,12 @@ async function buildExpenseCategoryHistory(env: Env): Promise<string> {
 }
 
 async function buildExpenseContext(env: Env): Promise<string> {
-  const expenses = await listExpenses(env, "month");
-  const total = expenses.reduce((sum, row) => sum + row.amount, 0);
-  const byCategory = summarizeExpensesByCategory(expenses).slice(0, 6);
+  const [expenses, summary] = await Promise.all([
+    listExpenses(env, "month"),
+    summarizeExpenseRange(env, "month")
+  ]);
+  const total = summary.total;
+  const byCategory = summary.byCategory.slice(0, 6);
   const recent = expenses.slice(0, 5);
   return [
     "支出状況（今月）",
@@ -2544,17 +2551,20 @@ async function maybeSendMonthlyExpenseReport(env: Env): Promise<void> {
 
   const start = `${monthKey}-01T00:00:00+09:00`;
   const end = `${monthKey}-${pad(parts.day)}T23:59:59+09:00`;
-  const rows = await env.DB.prepare(
-    `SELECT id, amount, category, memo, store, spent_at, created_at
-     FROM expenses
-     WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)
-     ORDER BY datetime(spent_at) ASC`
-  ).bind(start, end).all<ExpenseRow>();
+  const [summary, rows] = await Promise.all([
+    summarizeExpenseRange(env, "month"),
+    env.DB.prepare(
+      `SELECT id, amount, category, memo, store, spent_at, created_at
+       FROM expenses
+       WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)
+       ORDER BY datetime(spent_at) ASC`
+    ).bind(start, end).all<ExpenseRow>()
+  ]);
   const expenses = rows.results ?? [];
-  const total = expenses.reduce((sum, row) => sum + row.amount, 0);
-  const byCategory = summarizeExpensesByCategory(expenses);
+  const total = summary.total;
+  const byCategory = summary.byCategory;
   const ai = await monthlyExpenseAiComment(env, monthKey, total, byCategory, expenses.slice(-5));
-  const hierarchy = buildExpenseHierarchyParts(expenses, EXPENSE_CATEGORIES, 5);
+  const hierarchy = buildExpenseHierarchyParts(expenses, EXPENSE_CATEGORIES, 5, summary);
   const message = fitDiscordContent({
     header: [ai || `先生、${monthKey}の支出レポートです。消費は計画的に、ですよ。`, "", ...hierarchy.header, ...(expenses.length ? [] : ["記録された支出はありません。"])],
     sections: hierarchy.sections
@@ -2707,18 +2717,48 @@ async function maybeSendWeeklyMutterResponse(env: Env): Promise<void> {
   await markDailySummarySent(env, summaryKey);
 }
 
-function summarizeExpensesByCategory(expenses: ExpenseRow[]): { category: string; total: number }[] {
-  const map = new Map<string, number>();
-  for (const expense of expenses) {
-    const category = normalizeExpenseCategory(expense.category, EXPENSE_CATEGORIES);
-    map.set(category, (map.get(category) ?? 0) + expense.amount);
-  }
-  return EXPENSE_CATEGORIES
-    .filter((category) => map.has(category))
-    .map((category) => ({ category, total: map.get(category) ?? 0 }));
+type ExpenseDateRange = { start: string; end: string };
+type ExpenseAggregateRow = { category: string | null; total: number | null };
+type ExpenseTotalRow = { total: number | null };
+
+function expenseDateRange(env: Env, range: string): ExpenseDateRange | null {
+  if (range === "all") return null;
+  const now = new Date();
+  const parts = zonedParts(now, env.TIMEZONE ?? "Asia/Tokyo");
+  return {
+    start: `${parts.year}-${pad(parts.month)}-01T00:00:00+09:00`,
+    end: `${parts.year}-${pad(parts.month)}-${pad(lastDayOfMonth(parts.year, parts.month))}T23:59:59+09:00`
+  };
 }
 
-async function monthlyExpenseAiComment(env: Env, monthKey: string, total: number, byCategory: { category: string; total: number }[], recent: ExpenseRow[]): Promise<string> {
+function prepareExpenseRangeQuery(env: Env, query: string, dateRange: ExpenseDateRange | null) {
+  const statement = env.DB.prepare(query);
+  return dateRange ? statement.bind(dateRange.start, dateRange.end) : statement;
+}
+
+async function summarizeExpenseRange(env: Env, range: string): Promise<ExpenseSummary> {
+  const dateRange = expenseDateRange(env, range);
+  const where = dateRange ? " WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)" : "";
+  const [totalRow, groupedRows] = await Promise.all([
+    prepareExpenseRangeQuery(env, `SELECT SUM(amount) AS total FROM expenses${where}`, dateRange)
+      .first<ExpenseTotalRow>(),
+    prepareExpenseRangeQuery(env, `SELECT category, SUM(amount) AS total FROM expenses${where} GROUP BY category`, dateRange)
+      .all<ExpenseAggregateRow>()
+  ]);
+  const totals = new Map<string, number>();
+  for (const row of groupedRows.results ?? []) {
+    const category = normalizeExpenseCategory(row.category, EXPENSE_CATEGORIES);
+    totals.set(category, (totals.get(category) ?? 0) + Number(row.total ?? 0));
+  }
+  return {
+    total: Number(totalRow?.total ?? 0),
+    byCategory: EXPENSE_CATEGORIES
+      .filter((category) => totals.has(category))
+      .map((category) => ({ category, total: totals.get(category) ?? 0 }))
+  };
+}
+
+async function monthlyExpenseAiComment(env: Env, monthKey: string, total: number, byCategory: readonly { category: string; total: number }[], recent: ExpenseRow[]): Promise<string> {
   try {
     const persona = await loadPersona(env);
     return await geminiText(env, [
@@ -2827,24 +2867,16 @@ async function listReminders(env: Env): Promise<ReminderRow[]> {
 }
 
 async function listExpenses(env: Env, range: string): Promise<ExpenseRow[]> {
-  if (range === "all") {
-    const rows = await env.DB.prepare(
-      "SELECT id, amount, category, memo, store, spent_at, created_at FROM expenses ORDER BY datetime(spent_at) DESC, id DESC LIMIT 30"
-    ).all<ExpenseRow>();
-    return rows.results ?? [];
-  }
-
-  const now = new Date();
-  const parts = zonedParts(now, env.TIMEZONE ?? "Asia/Tokyo");
-  const start = `${parts.year}-${pad(parts.month)}-01T00:00:00+09:00`;
-  const end = `${parts.year}-${pad(parts.month)}-${pad(lastDayOfMonth(parts.year, parts.month))}T23:59:59+09:00`;
-  const rows = await env.DB.prepare(
+  const dateRange = expenseDateRange(env, range);
+  const where = dateRange ? " WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)" : "";
+  const rows = await prepareExpenseRangeQuery(
+    env,
     `SELECT id, amount, category, memo, store, spent_at, created_at
-     FROM expenses
-     WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)
+     FROM expenses${where}
      ORDER BY datetime(spent_at) DESC, id DESC
-     LIMIT 30`
-  ).bind(start, end).all<ExpenseRow>();
+     LIMIT 30`,
+    dateRange
+  ).all<ExpenseRow>();
   return rows.results ?? [];
 }
 
@@ -3067,11 +3099,11 @@ function formatExpenseCandidate(
   ].join("\n");
 }
 
-function formatExpenses(rows: ExpenseRow[], range: string, env: Env): string {
+function formatExpenses(rows: ExpenseRow[], range: string, env: Env, summary: ExpenseSummary): string {
   const title = range === "all" ? "支出メモ (all / 直近10件)" : "支出メモ (今月 / 直近10件)";
   if (!rows.length) return `${title}: なし`;
   const visible = rows.slice(0, 10);
-  const hierarchy = buildExpenseHierarchyParts(visible, EXPENSE_CATEGORIES);
+  const hierarchy = buildExpenseHierarchyParts(visible, EXPENSE_CATEGORIES, undefined, summary);
   return fitDiscordContent({
     header: [title, ...hierarchy.header],
     sections: hierarchy.sections
