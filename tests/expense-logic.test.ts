@@ -10,8 +10,135 @@ import {
   parseExpenseCorrection,
   resolveCorrectionTarget
 } from "../src/expense-logic.ts";
+import {
+  formatRequestList,
+  renderIntakeMessage,
+  resolveRequestAnswerTarget,
+  resolveRequestCue,
+  selectIntakeQuestions,
+  REQUEST_DETAILS_UPDATE_SQL
+} from "../src/request-logic.ts";
 
 const categories = ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"];
+
+test("機能要望の決定論トリガーは取消・先頭・含有の順で解決する", () => {
+  assert.deepEqual(resolveRequestCue("要望：カレンダー連携が欲しい"), {
+    kind: "new",
+    summary: "カレンダー連携が欲しい",
+    cueSpan: { start: 0, end: 3 }
+  });
+  assert.deepEqual(resolveRequestCue("機能要望です。レシートを読めるようにしてほしい"), {
+    kind: "new",
+    summary: "レシートを読めるようにしてほしい",
+    cueSpan: { start: 0, end: 7 }
+  });
+  assert.equal(resolveRequestCue("要望なし").kind, "cancel");
+  assert.equal(resolveRequestCue("さっきの要望取り消し").kind, "cancel");
+  assert.deepEqual(resolveRequestCue("要望取り消し機能が欲しい"), {
+    kind: "new",
+    summary: "要望取り消し機能が欲しい",
+    cueSpan: null
+  });
+  assert.equal(resolveRequestCue("要望書を会社に出した").kind, "none");
+  assert.equal(resolveRequestCue("今日は特に要望ない").kind, "none");
+  assert.equal(resolveRequestCue("要望はないけどこの機能は便利").kind, "none");
+  assert.equal(resolveRequestCue("要望：").summary, "");
+});
+
+test("聞き取り質問は不足分を優先順で最大2問、AI不正は0問", () => {
+  assert.deepEqual(selectIntakeQuestions({ scene: false, pain: false, outcome: false }), ["scene", "pain"]);
+  assert.deepEqual(selectIntakeQuestions({ scene: true, pain: true, outcome: false }), ["outcome"]);
+  assert.deepEqual(selectIntakeQuestions({ scene: true, pain: true, outcome: true }), []);
+  assert.deepEqual(selectIntakeQuestions(null), []);
+  assert.deepEqual(selectIntakeQuestions({ scene: false, pain: "yes", outcome: false } as unknown as { scene: boolean; pain: boolean; outcome: boolean }), []);
+});
+
+test("要望回答の対象決定はリプライ・bot投稿・直答の条件を分ける", () => {
+  const now = "2026-09-06T12:00:00+09:00";
+  const active = {
+    id: 1,
+    requestedBy: "user-1",
+    channelId: "channel-1",
+    intakeMessageId: "intake-1",
+    intakeAt: "2026-09-06T11:40:00+09:00",
+    pendingQuestions: "scene,pain"
+  };
+  assert.equal(resolveRequestAnswerTarget({
+    isReply: true,
+    replyMessageId: "intake-1",
+    referencedMessageIsBotIntakePost: false,
+    candidates: [active],
+    actorId: "user-1",
+    channelId: "channel-1",
+    now
+  }).kind, "reply_match");
+  assert.equal(resolveRequestAnswerTarget({
+    isReply: true,
+    replyMessageId: "old-intake",
+    referencedMessageIsBotIntakePost: true,
+    candidates: [],
+    actorId: "user-1",
+    channelId: "channel-1",
+    now
+  }).kind, "reply_missing");
+  assert.equal(resolveRequestAnswerTarget({
+    isReply: false,
+    referencedMessageIsBotIntakePost: false,
+    candidates: [active],
+    actorId: "user-1",
+    channelId: "channel-1",
+    now
+  }).kind, "direct_match");
+  assert.equal(resolveRequestAnswerTarget({
+    isReply: false,
+    referencedMessageIsBotIntakePost: false,
+    candidates: [{ ...active, intakeAt: "2026-09-06T11:29:00+09:00" }],
+    actorId: "user-1",
+    channelId: "channel-1",
+    now
+  }).kind, "none");
+  assert.equal(resolveRequestAnswerTarget({
+    isReply: false,
+    referencedMessageIsBotIntakePost: false,
+    candidates: [active, { ...active, id: 2, intakeMessageId: "intake-2" }],
+    actorId: "user-1",
+    channelId: "channel-1",
+    now
+  }).kind, "direct_ambiguous");
+});
+
+test("受付投稿は概要を表示だけ短縮し、固定質問と案内を残す", () => {
+  const original = "概要\n" + "あ".repeat(2_000);
+  const output = renderIntakeMessage(original, ["scene", "pain"]);
+  assert.ok([...output].length <= 1_900);
+  assert.match(output, /要望として受け付けました。/);
+  assert.match(output, /…/);
+  assert.match(output, /どの場面・どのチャンネルで使いたいですか？/);
+  assert.match(output, /今はどこが不便ですか？/);
+  assert.match(output, /答えはこのメッセージにリプライで。任意です/);
+  assert.match(renderIntakeMessage("概要", []), /詳細が必要になったら聞きますね/);
+});
+
+test("要望一覧は状態語と60字表示をfitする", () => {
+  const output = formatRequestList([
+    { id: 1, status: "open", summary: "あ".repeat(80) },
+    { id: 2, status: "in_progress", summary: "対応中の要望" },
+    { id: 3, status: "done", summary: "完了した要望" },
+    { id: 4, status: "declined", summary: "見送りの要望" }
+  ]);
+  assert.ok([...output].length <= 1_900);
+  assert.match(output, /#1 \[受付\]/);
+  assert.match(output, /#2 \[対応中\]/);
+  assert.match(output, /#3 \[対応済み\]/);
+  assert.match(output, /#4 \[見送り\]/);
+  assert.match(output, /…/);
+});
+
+test("要望詳細UPDATEは本人・チャンネル・openをWHEREで固定する", () => {
+  assert.match(REQUEST_DETAILS_UPDATE_SQL, /details = CASE WHEN details = '' THEN \? ELSE details \|\| char\(10\) \|\| \? END/);
+  assert.match(REQUEST_DETAILS_UPDATE_SQL, /pending_questions = ''/);
+  assert.match(REQUEST_DETAILS_UPDATE_SQL, /WHERE id = \? AND requested_by = \? AND channel_id = \? AND status = 'open'/);
+});
 
 test("分類指定表現は固定ルールで大分類を拾う", () => {
   assert.equal(findCategoryDesignation("その他で電池買った 220円", categories), "その他");
