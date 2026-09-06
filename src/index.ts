@@ -2608,12 +2608,13 @@ async function postBackupToReport(env: Env, channelId: string, reason: "manual" 
 }
 
 async function buildBackupJson(env: Env, reason: "manual" | "monthly"): Promise<Record<string, unknown>> {
-  const [todos, reminders, expenses, appSettings, personaSettings, pendingActions, dailySummaries, channelStates] = await Promise.all([
+  const [todos, reminders, expenses, appSettings, personaSettings, featureRequests, pendingActions, dailySummaries, channelStates] = await Promise.all([
     env.DB.prepare("SELECT * FROM todos ORDER BY id ASC").all<Record<string, unknown>>(),
     env.DB.prepare("SELECT * FROM reminders ORDER BY id ASC").all<Record<string, unknown>>(),
     env.DB.prepare("SELECT * FROM expenses ORDER BY id ASC").all<Record<string, unknown>>(),
     env.DB.prepare("SELECT * FROM app_settings ORDER BY key ASC").all<Record<string, unknown>>(),
     env.DB.prepare("SELECT * FROM persona_settings ORDER BY id ASC").all<Record<string, unknown>>(),
+    env.DB.prepare("SELECT * FROM feature_requests ORDER BY id ASC").all<Record<string, unknown>>(),
     env.DB.prepare("SELECT * FROM pending_actions ORDER BY created_at ASC").all<Record<string, unknown>>(),
     env.DB.prepare("SELECT * FROM daily_summaries ORDER BY summary_key ASC").all<Record<string, unknown>>(),
     env.DB.prepare("SELECT * FROM channel_states ORDER BY channel_id ASC").all<Record<string, unknown>>()
@@ -2623,11 +2624,12 @@ async function buildBackupJson(env: Env, reason: "manual" | "monthly"): Promise<
     reminders: reminders.results ?? [],
     expenses: expenses.results ?? [],
     app_settings: appSettings.results ?? [],
-    persona_settings: personaSettings.results ?? []
+    persona_settings: personaSettings.results ?? [],
+    feature_requests: featureRequests.results ?? []
   };
   return {
     kind: "discord-secretary-bot-d1-backup",
-    backup_version: 1,
+    backup_version: 2,
     reason,
     exported_at: new Date().toISOString(),
     timezone: env.TIMEZONE ?? "Asia/Tokyo",
@@ -2638,7 +2640,8 @@ async function buildBackupJson(env: Env, reason: "manual" | "monthly"): Promise<
       reminders: data.reminders.length,
       expenses: data.expenses.length,
       app_settings: data.app_settings.length,
-      persona_settings: data.persona_settings.length
+      persona_settings: data.persona_settings.length,
+      feature_requests: data.feature_requests.length
     },
     data,
     volatile: {
