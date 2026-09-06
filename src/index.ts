@@ -249,6 +249,8 @@ const RESPONSE = {
 const EPHEMERAL = 1 << 6;
 const GEMINI_MESSAGE_RETRY_LIMIT = 5;
 const GEMINI_OUTAGE_MINUTES = 30;
+const EXPENSE_CHAT_POLICY = "先生が自分から浪費・使いすぎの話題を出した時だけ、会計担当として叱ってよい。ユウカから支出の話題を持ち出さない";
+const EXPENSE_CHAT_SUPPRESSION = "この発言の支出には別で小言を出すので、ここでは叱らない";
 
 class GeminiUnavailableError extends Error {
   readonly status?: number;
@@ -1866,6 +1868,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
   if (!actionable.length && shouldChatReply(text)) {
     actionable.push({ type: "chat_reply", content: text });
   }
+  const hasExpenseCandidate = actionable.some((event) => event.type === "expense_candidate");
 
   let requestGuidanceAdded = false;
   let featureRequestAccepted = false;
@@ -1986,15 +1989,21 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
     if (event.type === "chat_reply") {
       const persona = await loadPersona(env);
       const expenseContext = shouldIncludeExpenseContext(text) ? await buildExpenseContext(env) : "";
-      let answer = replyChain.length ? await chatReplyWithContext(env, text, replyChain, expenseContext) : event.reply && !expenseContext ? event.reply : await geminiText(env, [
-        personaPrompt(persona),
-        manualPrompt(),
-        "Discordの雑談ルームで、先生に短く自然に返答してください。タスク登録は自動で確定しない。1〜3文。",
-        "ユーザーが求めていない限り、雑談を打ち切ったり、別行動へ誘導したりしないでください。",
-        expenseContext ? "先生は支出・浪費・予算について話しています。支出状況を踏まえて、会計担当として自然に返してください。数字は支出状況にあるものだけ使い、捏造しないでください。" : "",
-        expenseContext,
-        `先生の発言: ${text}`
-      ].filter(Boolean).join("\n\n"), 0.75);
+      let answer = replyChain.length
+        ? await chatReplyWithContext(env, text, replyChain, expenseContext, hasExpenseCandidate)
+        : event.reply && !expenseContext && !hasExpenseCandidate
+          ? event.reply
+          : await geminiText(env, [
+            personaPrompt(persona),
+            manualPrompt(),
+            "Discordの雑談ルームで、先生に短く自然に返答してください。タスク登録は自動で確定しない。1〜3文。",
+            "ユーザーが求めていない限り、雑談を打ち切ったり、別行動へ誘導したりしないでください。",
+            EXPENSE_CHAT_POLICY,
+            hasExpenseCandidate ? EXPENSE_CHAT_SUPPRESSION : "",
+            expenseContext ? "先生は支出・浪費・予算について話しています。支出状況を踏まえて、会計担当として自然に返してください。数字は支出状況にあるものだけ使い、捏造しないでください。" : "",
+            expenseContext,
+            `先生の発言: ${text}`
+          ].filter(Boolean).join("\n\n"), 0.75);
       if (event.request_guidance && !requestGuidanceAdded) {
         answer = appendFeatureRequestGuidance(answer);
         requestGuidanceAdded = true;
@@ -2157,6 +2166,8 @@ async function classifyChatEvents(
     "出力形式: {\"events\":[{\"type\":\"chat_reply|todo_candidate|reminder_candidate|reminder_delete_candidate|done_candidate|expense_candidate|feature_request_candidate|none\",\"content\":\"...\",\"item\":\"品物\",\"store\":\"店\",\"datetime\":\"YYYY-MM-DDTHH:mm:ss+09:00 または null\",\"recurrence_rule\":null または {\"type\":\"daily|weekly|monthly\",\"interval\":1,\"weekdays\":[1],\"month_days\":[1],\"time\":\"09:00\",\"timezone\":\"Asia/Tokyo\"},\"recurrence_label\":\"毎週月曜\" または null,\"todo_id\":数値またはnull,\"reminder_id\":数値またはnull,\"amount\":金額数値またはnull,\"category\":\"大分類一覧のいずれか\",\"confidence\":\"high|medium|low\",\"reply\":\"...\"}]}",
     "feature_request_candidateのcontentは使わず、summaryには先生の発言原文を使う。confidenceがhighでなければchat_replyに変換し、返答末尾に要望の書式案内を1回だけ添える。",
     "chat_replyのreplyはユウカとして1〜3文。todo/reminder/doneの事実は変えない。",
+    EXPENSE_CHAT_POLICY,
+    `同じ発言からexpense_candidateとchat_replyを出す場合、chat_replyには「${EXPENSE_CHAT_SUPPRESSION}」を適用してください。`,
     "雑談では、ユーザーが求めていない限り会話を打ち切ったり、別行動へ誘導したりしない。照れ隠しは会話の返答として自然な範囲に留める。",
     "reminder_delete_candidateは未通知リマインダー一覧から最も近いものを選び、確信できる場合はreminder_idを入れてください。曖昧ならcontentだけ入れてreminder_idはnull。",
     "reminder_candidateで「毎日」「毎週月曜」「毎月1日」など繰り返しが明確ならrecurrence_ruleを入れる。曜日は月曜=1、火曜=2、水曜=3、木曜=4、金曜=5、土曜=6、日曜=7。datetimeは最初に通知する次回日時。",
@@ -2221,7 +2232,13 @@ async function aiAside(env: Env, instruction: string, facts: unknown): Promise<s
   }
 }
 
-async function chatReplyWithContext(env: Env, text: string, replyChain: ReplyContext[], expenseContext = ""): Promise<string> {
+async function chatReplyWithContext(
+  env: Env,
+  text: string,
+  replyChain: ReplyContext[],
+  expenseContext = "",
+  suppressScolding = false
+): Promise<string> {
   try {
     const persona = await loadPersona(env);
     return await geminiText(env, [
@@ -2229,7 +2246,8 @@ async function chatReplyWithContext(env: Env, text: string, replyChain: ReplyCon
       manualPrompt(),
       "Discordの雑談ルームで、先生への返信を書いてください。",
       "先生はリプライ会話の続きとして発言しています。会話の始まりから直近までを文脈として扱い、自然に返してください。",
-      "支出・浪費の話題なら、会計担当として呆れたり叱ったりしてよい。ただし先生を突き放さず、最後は次の一歩やフォローにつなげる。",
+      EXPENSE_CHAT_POLICY,
+      suppressScolding ? EXPENSE_CHAT_SUPPRESSION : "",
       expenseContext ? "支出状況が渡されている場合は、その数字を踏まえて返してください。数字は支出状況にあるものだけ使い、捏造しないでください。" : "",
       replyChain.length >= 16
         ? "リプライ文脈が上限の8ラリー相当に達しています。必要なら、会話が長く続いていることに軽く触れてよいです。"
