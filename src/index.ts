@@ -1,4 +1,6 @@
 import { YUUKA_PHRASES } from "./yuuka-phrases";
+import { expenseAiComment as buildExpenseAiComment, type ExpenseCommentGenerator } from "./expense-comment";
+export type { ExpenseCommentGenerator } from "./expense-comment";
 import { HIDDEN_ADULT_PRANK_HINTS, HIDDEN_ADULT_PRANK_KEYWORDS } from "./hidden-reaction-patterns";
 import {
   buildExpenseHierarchyParts,
@@ -8,6 +10,8 @@ import {
   normalizeExpenseCategory,
   parseExpenseCorrection,
   resolveCorrectionTarget,
+  scoldLevel,
+  type ScoldLevel,
   type CategoryConfig,
   type CorrectionTargetDecision,
   type ExpenseCorrection,
@@ -247,8 +251,11 @@ const GEMINI_MESSAGE_RETRY_LIMIT = 5;
 const GEMINI_OUTAGE_MINUTES = 30;
 
 class GeminiUnavailableError extends Error {
-  constructor(message: string, readonly status?: number) {
+  readonly status?: number;
+
+  constructor(message: string, status?: number) {
     super(message);
+    this.status = status;
     this.name = "GeminiUnavailableError";
   }
 }
@@ -874,13 +881,31 @@ async function processExpenseCategorySelect(interaction: DiscordInteraction, env
 
   const selected = interaction.data?.values?.[0]?.normalize("NFKC").trim();
   const category = selected
-    ? EXPENSE_CATEGORIES.find((candidate) => candidate.normalize("NFKC") === selected)
+    ? EXPENSE_CATEGORY_CONFIG.categories.find((candidate) => candidate.normalize("NFKC") === selected)
     : undefined;
   if (!category) return reply("その大分類は一覧にありません。プルダウンから選んでください。", true);
 
+  const previousPayload = expensePendingPayload(pending);
+  const previousCategory = normalizeExpenseCategory(previousPayload.category, EXPENSE_CATEGORY_CONFIG);
+  const amount = Math.max(0, Math.round(Number(previousPayload.amount ?? 0)));
+  const categoryChanged = previousCategory !== category;
+  let expression = "json_set(payload, '$.category', ?)";
+  const bindings: (string | number | null)[] = [category];
+  if (categoryChanged) {
+    const aiComment = await expenseAiComment(
+      env,
+      scoldLevel(category, amount),
+      amount,
+      category,
+      String(previousPayload.memo ?? previousPayload.item ?? previousPayload.content ?? ""),
+      stringOrNull(previousPayload.store)
+    );
+    expression = `json_set(${expression}, '$.ai_comment', ?)`;
+    bindings.push(aiComment);
+  }
   const updated = await env.DB.prepare(
-    "UPDATE pending_actions SET payload = json_set(payload, '$.category', ?) WHERE id = ? AND kind = 'expense' AND requested_by = ?"
-  ).bind(category, id, pending.requested_by).run();
+    `UPDATE pending_actions SET payload = ${expression} WHERE id = ? AND kind = 'expense' AND requested_by = ?`
+  ).bind(...bindings, id, pending.requested_by).run();
   if (!updated.meta.changes) return updateMessage(EXPENSE_PENDING_UNAVAILABLE);
 
   const latest = await env.DB.prepare(
@@ -1754,11 +1779,30 @@ async function handleExpenseCorrection(env: Env, message: DiscordMessage, pendin
     return;
   }
 
+  const nextPayload = { ...payload };
+  for (const [key, value] of entries) nextPayload[key] = value;
+  const previousCategory = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORY_CONFIG);
+  const nextCategory = normalizeExpenseCategory(nextPayload.category, EXPENSE_CATEGORY_CONFIG);
+  const previousAmount = Math.max(0, Math.round(Number(payload.amount ?? 0)));
+  const nextAmount = Math.max(0, Math.round(Number(nextPayload.amount ?? 0)));
+  const categoryOrAmountChanged = previousCategory !== nextCategory || previousAmount !== nextAmount;
   let expression = "payload";
   const bindings: (string | number | null)[] = [];
   for (const [key, value] of entries) {
     expression = `json_set(${expression}, '$.${key}', ?)`;
     bindings.push(value);
+  }
+  if (categoryOrAmountChanged) {
+    const aiComment = await expenseAiComment(
+      env,
+      scoldLevel(nextCategory, nextAmount),
+      nextAmount,
+      nextCategory,
+      String(nextPayload.memo ?? nextPayload.item ?? nextPayload.content ?? ""),
+      stringOrNull(nextPayload.store)
+    );
+    expression = `json_set(${expression}, '$.ai_comment', ?)`;
+    bindings.push(aiComment);
   }
   const updated = await env.DB.prepare(
     `UPDATE pending_actions SET payload = ${expression}
@@ -1914,7 +1958,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
       const item = String(event.item ?? event.content).trim();
       const memo = normalizeExpenseMemo(item, category);
       const store = stringOrNull(event.store);
-      const aside = await expenseAiComment(env, amount, category, memo, store);
+      const aside = await expenseAiComment(env, scoldLevel(category, amount), amount, category, memo, store);
       await createPendingPost(
         env,
         message.channel_id,
@@ -2203,35 +2247,24 @@ async function chatReplyWithContext(env: Env, text: string, replyChain: ReplyCon
   }
 }
 
-async function expenseAiComment(env: Env, amount: number, category: string | null, memo: string, store: string | null): Promise<string> {
-  try {
-    const persona = await loadPersona(env);
-    const tone = amount >= 30000
-      ? "かなり強めに驚き、呆れ、会計担当として叱る。ただし人格否定はしない。"
-      : amount >= 10000
-        ? "驚きつつ、会計担当として少し強めに確認する。"
-        : amount >= 3000
-          ? "軽く呆れつつ、記録すること自体は評価する。"
-          : "軽く確認し、記録を促す。";
-    const answer = await geminiText(env, [
-      personaPrompt(persona),
-      "Discordで支出・浪費メモ候補を出す直前に、早瀬ユウカとしてコメントしてください。",
-      "会計担当らしく、金額を見て少し呆れたり叱ったり、必要なら机を叩くような勢いを出してよいです。",
-      "ただし長説教にしない。支出候補の定型文の前に置く文章なので、1〜3文。金額・大分類・品物・店の事実は変えない。",
-      "最後は記録確認につながる言い方にしてください。箇条書きは禁止。",
-      `トーン: ${tone}`,
-      `金額: ${amount}円`,
-      `大分類: ${category ?? "その他"}`,
-      `品物: ${memo}`,
-      `店: ${store ?? "未設定"}`
-    ].join("\n\n"), 0.9);
-    return answer.split("\n").map((line) => line.trim()).filter(Boolean).join("\n").slice(0, 260);
-  } catch (error) {
-    console.error("expense ai comment failed", error);
-    if (amount >= 30000) return "先生！？ その支出額は会計担当として見過ごせません。まずは記録して、あとで予算を再計算しますよ。";
-    if (amount >= 10000) return "先生、その出費は少し大きいです。記録して、今月の変数に入れておきましょう。";
-    return "先生、支出を確認しました。小さな出費でも、記録しておくのが大事です。";
-  }
+export async function expenseAiComment(
+  env: Env,
+  level: ScoldLevel,
+  amount: number,
+  category: string | null,
+  memo: string,
+  store: string | null,
+  generate: ExpenseCommentGenerator = (prompt, temperature) => geminiText(env, prompt, temperature)
+): Promise<string> {
+  return buildExpenseAiComment(
+    level,
+    amount,
+    category,
+    memo,
+    store,
+    () => loadPersona(env).then((persona) => personaPrompt(persona)),
+    generate
+  );
 }
 
 function shouldIncludeExpenseContext(text: string): boolean {

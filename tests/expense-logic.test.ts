@@ -21,6 +21,7 @@ import {
   selectIntakeQuestions,
   REQUEST_DETAILS_UPDATE_SQL
 } from "../src/request-logic.ts";
+import { expenseAiComment } from "../src/expense-comment.ts";
 
 const categoryConfig: CategoryConfig = {
   categories: ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"],
@@ -195,6 +196,24 @@ test("趣味の支出だけ金額で叱り尺度を決める", () => {
   assert.equal(scoldLevel("趣味", 9_999), 1);
   assert.equal(scoldLevel("趣味", SCOLD_LEVEL2_MIN_AMOUNT), 2);
   assert.equal(scoldLevel(normalizeExpenseCategory("ゲーム", categoryConfig), 15_000), 2);
+});
+
+test("支出コメント生成は尺度0でAIを呼ばず、尺度1・2で1回だけ呼ぶ", async () => {
+  let calls = 0;
+  const loadPersona = async (): Promise<string> => "テスト用ユウカ";
+  const generate = async (prompt: string, temperature: number): Promise<string> => {
+    calls += 1;
+    assert.ok(prompt.length > 0);
+    assert.equal(temperature, 0.9);
+    return "記録できる形に整えておきます。";
+  };
+
+  await expenseAiComment(0, 2_000, "食費", "昼食", null, loadPersona, generate);
+  assert.equal(calls, 0);
+  await expenseAiComment(1, 2_000, "趣味", "本", null, loadPersona, generate);
+  assert.equal(calls, 1);
+  await expenseAiComment(2, 10_000, "趣味", "ゲーム機", "店", loadPersona, generate);
+  assert.equal(calls, 2);
 });
 
 test("訂正の合図と対象決定の5分岐", () => {
