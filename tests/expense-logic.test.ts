@@ -8,7 +8,10 @@ import {
   hasCorrectionCue,
   normalizeExpenseCategory,
   parseExpenseCorrection,
-  resolveCorrectionTarget
+  resolveCorrectionTarget,
+  SCOLD_LEVEL2_MIN_AMOUNT,
+  scoldLevel,
+  type CategoryConfig
 } from "../src/expense-logic.ts";
 import {
   formatRequestList,
@@ -19,7 +22,16 @@ import {
   REQUEST_DETAILS_UPDATE_SQL
 } from "../src/request-logic.ts";
 
-const categories = ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"];
+const categoryConfig: CategoryConfig = {
+  categories: ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"],
+  aliases: {
+    "交通": "交通費",
+    "ゲーム": "趣味",
+    "書籍": "趣味",
+    "交際": "交際費",
+    "医療": "医療費"
+  }
+};
 
 test("機能要望の決定論トリガーは取消・先頭・含有の順で解決する", () => {
   assert.deepEqual(resolveRequestCue("要望：カレンダー連携が欲しい"), {
@@ -141,32 +153,48 @@ test("要望詳細UPDATEは本人・チャンネル・openをWHEREで固定す�
 });
 
 test("分類指定表現は固定ルールで大分類を拾う", () => {
-  assert.equal(findCategoryDesignation("その他で電池買った 220円", categories), "その他");
-  assert.equal(findCategoryDesignation("イオンで牛乳 300円", categories), null);
-  assert.equal(findCategoryDesignation("カテゴリは雑費、電池220円", categories), "雑費");
-  assert.equal(findCategoryDesignation("食費っていうか雑費で", categories), "食費");
-  assert.equal(findCategoryDesignation("趣味の店で買った500円", categories), null);
-  assert.equal(findCategoryDesignation("サブスク解約で3000円浮いた", categories), null);
-  assert.equal(findCategoryDesignation("今日は趣味で買った", categories), "趣味");
+  assert.equal(findCategoryDesignation("その他で電池買った 220円", categoryConfig), "その他");
+  assert.equal(findCategoryDesignation("イオンで牛乳 300円", categoryConfig), null);
+  assert.equal(findCategoryDesignation("カテゴリは雑費、電池220円", categoryConfig), "雑費");
+  assert.equal(findCategoryDesignation("食費っていうか雑費で", categoryConfig), "食費");
+  assert.equal(findCategoryDesignation("趣味の店で買った500円", categoryConfig), null);
+  assert.equal(findCategoryDesignation("サブスク解約で3000円浮いた", categoryConfig), null);
+  assert.equal(findCategoryDesignation("今日は趣味で買った", categoryConfig), "趣味");
+  assert.equal(findCategoryDesignation("ゲームで課金3000円", categoryConfig), "趣味");
 });
 
-test("一覧外の大分類はその他へ丸める", () => {
-  assert.equal(normalizeExpenseCategory("ゲーム", categories), "その他");
-  assert.equal(normalizeExpenseCategory(null, categories), "その他");
-  assert.equal(normalizeExpenseCategory("食費", categories), "食費");
+test("旧分類別名は正規化時だけ新分類へ対応付ける", () => {
+  assert.equal(normalizeExpenseCategory("ゲーム", categoryConfig), "趣味");
+  assert.equal(normalizeExpenseCategory("書籍", categoryConfig), "趣味");
+  assert.equal(normalizeExpenseCategory("交通", categoryConfig), "交通費");
+  assert.equal(normalizeExpenseCategory("不明", categoryConfig), "その他");
+  assert.equal(normalizeExpenseCategory(null, categoryConfig), "その他");
+  assert.equal(normalizeExpenseCategory("食費", categoryConfig), "食費");
 });
 
 test("支出訂正の決定論パーサー", () => {
-  assert.deepEqual(parseExpenseCorrection("雑費にして", categories), { category: "雑費" });
-  assert.deepEqual(parseExpenseCorrection("店はまいばすけっと", categories), { store: "まいばすけっと" });
-  assert.deepEqual(parseExpenseCorrection("500円だった", categories), { amount: 500 });
-  assert.deepEqual(parseExpenseCorrection("", categories), {});
-  assert.deepEqual(parseExpenseCorrection("雑費にして、店はまいばすけっと、品物は電池、500円", categories), {
+  assert.deepEqual(parseExpenseCorrection("雑費にして", categoryConfig), { category: "雑費" });
+  assert.deepEqual(parseExpenseCorrection("書籍にして", categoryConfig), { category: "趣味" });
+  assert.deepEqual(parseExpenseCorrection("店はまいばすけっと", categoryConfig), { store: "まいばすけっと" });
+  assert.deepEqual(parseExpenseCorrection("500円だった", categoryConfig), { amount: 500 });
+  assert.deepEqual(parseExpenseCorrection("", categoryConfig), {});
+  assert.deepEqual(parseExpenseCorrection("雑費にして、店はまいばすけっと、品物は電池、500円", categoryConfig), {
     category: "雑費",
     store: "まいばすけっと",
     memo: "電池",
     amount: 500
   });
+});
+
+test("趣味の支出だけ金額で叱り尺度を決める", () => {
+  assert.equal(SCOLD_LEVEL2_MIN_AMOUNT, 10_000);
+  assert.equal(scoldLevel("食費", 50_000), 0);
+  assert.equal(scoldLevel("サブスク", 50_000), 0);
+  assert.equal(scoldLevel("交際費", 50_000), 0);
+  assert.equal(scoldLevel("趣味", 2_000), 1);
+  assert.equal(scoldLevel("趣味", 9_999), 1);
+  assert.equal(scoldLevel("趣味", SCOLD_LEVEL2_MIN_AMOUNT), 2);
+  assert.equal(scoldLevel(normalizeExpenseCategory("ゲーム", categoryConfig), 15_000), 2);
 });
 
 test("訂正の合図と対象決定の5分岐", () => {
@@ -185,14 +213,29 @@ test("大分類順の階層表示と一覧外の集約", () => {
     { id: 2, amount: 220, category: "ゲーム", memo: "電池", store: "ダイソー", spent_at: "2026-09-04T12:00:00+09:00" },
     { id: 3, amount: 2000, category: "雑費", memo: "雑貨", store: null, spent_at: "2026-09-03T12:00:00+09:00" }
   ];
-  const output = formatExpenseHierarchy(rows, categories);
+  const output = formatExpenseHierarchy(rows, categoryConfig);
   assert.match(output, /合計: 2,900円/);
   assert.match(output, /■ 食費 680円/);
   assert.match(output, /  - 9\/5 牛乳とパン @ イオン 680円/);
   assert.match(output, /■ 雑費 2,000円/);
-  assert.match(output, /■ その他 220円/);
+  assert.match(output, /■ 趣味 220円/);
   assert.ok(output.indexOf("■ 食費") < output.indexOf("■ 雑費"));
-  assert.ok(output.indexOf("■ 雑費") < output.indexOf("■ その他"));
+  assert.ok(output.indexOf("■ 雑費") < output.indexOf("■ 趣味"));
+});
+
+test("旧分類別名は集計と階層表示で正規化先に合流する", () => {
+  const rows = [
+    { amount: 100, category: "交通", memo: "電車", store: null, spent_at: "2026-09-05T12:00:00+09:00" },
+    { amount: 200, category: "交通費", memo: "バス", store: null, spent_at: "2026-09-05T12:00:00+09:00" },
+    { amount: 150, category: "ゲーム", memo: "ゲーム課金", store: null, spent_at: "2026-09-05T12:00:00+09:00" },
+    { amount: 250, category: "書籍", memo: "本", store: null, spent_at: "2026-09-05T12:00:00+09:00" },
+    { amount: 300, category: "趣味", memo: "模型", store: null, spent_at: "2026-09-05T12:00:00+09:00" }
+  ];
+  const output = formatExpenseHierarchy(rows, categoryConfig);
+  assert.match(output, /■ 交通費 300円/);
+  assert.match(output, /■ 趣味 700円/);
+  assert.equal(output.match(/■ 交通費/g)?.length, 1);
+  assert.equal(output.match(/■ 趣味/g)?.length, 1);
 });
 
 test("一覧は明細10件、合計と小計は範囲全体", () => {
@@ -209,7 +252,7 @@ test("一覧は明細10件、合計と小計は範囲全体", () => {
     { id: 12, amount: 700, category: "ゲーム", memo: "範囲全体の一覧外", store: null, spent_at: "2026-09-03T12:00:00+09:00" }
   ];
   const visibleRows = allRows.slice(0, 10);
-  const parts = buildExpenseHierarchyParts(visibleRows, categories, undefined, {
+  const parts = buildExpenseHierarchyParts(visibleRows, categoryConfig, undefined, {
     total: 2_200,
     byCategory: [
       { category: "食費", total: 1_000 },
@@ -221,7 +264,7 @@ test("一覧は明細10件、合計と小計は範囲全体", () => {
   assert.match(output, /合計: 2,200円/);
   assert.match(output, /■ 食費 1,000円/);
   assert.match(output, /■ 雑費 500円/);
-  assert.match(output, /■ その他 700円/);
+  assert.match(output, /■ 趣味 700円/);
   assert.equal(output.split("\n").filter((line) => line.startsWith("  - ")).length, 10);
   assert.doesNotMatch(output, /範囲全体の雑費|範囲全体の一覧外/);
 });
@@ -235,7 +278,7 @@ test("Discord文字数境界は明細を行単位で省略する", () => {
     store: "い".repeat(40),
     spent_at: "2026-09-05T12:00:00+09:00"
   }));
-  const parts = buildExpenseHierarchyParts(rows, categories);
+  const parts = buildExpenseHierarchyParts(rows, categoryConfig);
   const output = fitDiscordContent(parts, 1900);
   assert.ok([...output].length <= 1900);
   assert.match(output, /合計: 4,000円/);

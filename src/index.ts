@@ -8,6 +8,7 @@ import {
   normalizeExpenseCategory,
   parseExpenseCorrection,
   resolveCorrectionTarget,
+  type CategoryConfig,
   type CorrectionTargetDecision,
   type ExpenseCorrection,
   type ExpenseSummary
@@ -26,7 +27,8 @@ import {
 import { YUUKA_MANUAL } from "./yuuka-manual";
 import expenseCategories from "./expense-categories.json";
 
-const EXPENSE_CATEGORIES = expenseCategories as string[];
+const EXPENSE_CATEGORY_CONFIG = expenseCategories as CategoryConfig;
+const EXPENSE_CATEGORIES = EXPENSE_CATEGORY_CONFIG.categories;
 
 export interface Env {
   DB: D1Database;
@@ -394,7 +396,7 @@ async function handleExpenseCommand(interaction: DiscordInteraction, env: Env): 
     const range = getString(sub, "range") ?? "all";
     const [rows, summary] = await Promise.all([
       listExpenses(env, range),
-      summarizeExpenseRange(env, range)
+      summarizeExpenseRange(env, range, EXPENSE_CATEGORY_CONFIG)
     ]);
     return expenseListWithDeleteButtons(rows, range, env, summary);
   }
@@ -835,7 +837,7 @@ async function recordExpensePendingAction(
 
   const amount = Math.max(0, Math.round(Number(payload.amount ?? 0)));
   if (!amount) return updateMessage("金額が読み取れませんでした。もう一度書き直してください。");
-  const category = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORIES);
+  const category = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORY_CONFIG);
   const memo = String(payload.memo ?? payload.item ?? payload.content ?? "");
   const store = stringOrNull(payload.store);
   const spentAt = String(payload.spent_at ?? new Date().toISOString());
@@ -1677,7 +1679,7 @@ async function parseExpenseCorrectionWithAi(env: Env, text: string, payload: Rec
     const parsed = JSON.parse(jsonText) as Record<string, unknown>;
     const correction: ExpenseCorrection = {};
     if (Object.prototype.hasOwnProperty.call(parsed, "category")) {
-      correction.category = normalizeExpenseCategory(parsed.category, EXPENSE_CATEGORIES);
+      correction.category = normalizeExpenseCategory(parsed.category, EXPENSE_CATEGORY_CONFIG);
     }
     for (const key of ["memo", "store", "spent_at"] as const) {
       if (!Object.prototype.hasOwnProperty.call(parsed, key)) continue;
@@ -1742,7 +1744,7 @@ async function handleExpenseCorrection(env: Env, message: DiscordMessage, pendin
     return;
   }
 
-  let correction = parseExpenseCorrection(message.content, EXPENSE_CATEGORIES);
+  let correction = parseExpenseCorrection(message.content, EXPENSE_CATEGORY_CONFIG);
   if (!correctionFieldEntries(correction).length) {
     correction = await parseExpenseCorrectionWithAi(env, message.content, payload);
   }
@@ -1815,7 +1817,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
     return;
   }
 
-  const events = await classifyChatEvents(env, text, replyChain);
+  const events = await classifyChatEvents(env, text, replyChain, EXPENSE_CATEGORY_CONFIG);
   const actionable = events.filter((event) => event.type !== "none").slice(0, 4);
   if (!actionable.length && shouldChatReply(text)) {
     actionable.push({ type: "chat_reply", content: text });
@@ -1908,7 +1910,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
 
     if (event.type === "expense_candidate" && event.amount && (event.item ?? event.content)) {
       const amount = Math.round(Number(event.amount));
-      const category = normalizeExpenseCategory(event.category, EXPENSE_CATEGORIES);
+      const category = normalizeExpenseCategory(event.category, EXPENSE_CATEGORY_CONFIG);
       const item = String(event.item ?? event.content).trim();
       const memo = normalizeExpenseMemo(item, category);
       const store = stringOrNull(event.store);
@@ -2088,13 +2090,18 @@ function formatReplyChain(replyChain: ReplyContext[]): string {
     .join("\n");
 }
 
-async function classifyChatEvents(env: Env, text: string, replyChain: ReplyContext[] = []): Promise<ChatEvent[]> {
+async function classifyChatEvents(
+  env: Env,
+  text: string,
+  replyChain: ReplyContext[] = [],
+  config: CategoryConfig = EXPENSE_CATEGORY_CONFIG
+): Promise<ChatEvent[]> {
   const openTodos = await listTodos(env, "all");
   const openReminders = await listReminders(env);
-  const expenseHistory = await buildExpenseCategoryHistory(env);
+  const expenseHistory = await buildExpenseCategoryHistory(env, config);
   const prompt = [
     manualPrompt(),
-    "大分類一覧: " + EXPENSE_CATEGORIES.join("|"),
+    "大分類一覧: " + config.categories.join("|"),
     "直近の支出から作った分類履歴（JSON 1行・最大15組）:\n" + expenseHistory,
     "Discordの雑談発言から、複数のイベントを抽出し、JSONだけで返してください。",
     "1つの発言に雑談、todo、リマインダー、完了報告が混ざる場合は、それぞれ別イベントにしてください。",
@@ -2133,7 +2140,7 @@ async function classifyChatEvents(env: Env, text: string, replyChain: ReplyConte
       return {
         ...event,
         item,
-        category: event.type === "expense_candidate" ? normalizeExpenseCategory(event.category, EXPENSE_CATEGORIES) : event.category,
+        category: event.type === "expense_candidate" ? normalizeExpenseCategory(event.category, config) : event.category,
         recurrence_rule: event.type === "reminder_candidate" ? recurrence : event.recurrence_rule,
         recurrence_label: event.type === "reminder_candidate" ? event.recurrence_label ?? recurrenceLabel(recurrence) : event.recurrence_label
       };
@@ -2142,7 +2149,7 @@ async function classifyChatEvents(env: Env, text: string, replyChain: ReplyConte
       ? { ...event, type: "chat_reply", request_guidance: true }
       : event);
     const expenseEvents = events.filter((event) => event.type === "expense_candidate");
-    const designation = findCategoryDesignation(text, EXPENSE_CATEGORIES);
+    const designation = findCategoryDesignation(text, config);
     if (designation && expenseEvents.length === 1) {
       events = events.map((event) => event.type === "expense_candidate" ? { ...event, category: designation } : event);
     }
@@ -2269,14 +2276,14 @@ function truncateExpenseText(value: unknown, max: number): string {
   return characters.length > max ? `${characters.slice(0, Math.max(0, max - 1)).join("")}…` : text;
 }
 
-async function buildExpenseCategoryHistory(env: Env): Promise<string> {
+async function buildExpenseCategoryHistory(env: Env, config: CategoryConfig): Promise<string> {
   const recent = await listExpenses(env, "all");
   const seen = new Set<string>();
   const history: { item: string; store: string | null; category: string }[] = [];
   for (const expense of recent.slice(0, 30)) {
     const item = truncateExpenseText(expense.memo, 20);
     const store = expense.store ? truncateExpenseText(expense.store, 20) : null;
-    const category = normalizeExpenseCategory(expense.category, EXPENSE_CATEGORIES);
+    const category = normalizeExpenseCategory(expense.category, config);
     const key = JSON.stringify([item, store, category]);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -2289,7 +2296,7 @@ async function buildExpenseCategoryHistory(env: Env): Promise<string> {
 async function buildExpenseContext(env: Env): Promise<string> {
   const [expenses, summary] = await Promise.all([
     listExpenses(env, "month"),
-    summarizeExpenseRange(env, "month")
+    summarizeExpenseRange(env, "month", EXPENSE_CATEGORY_CONFIG)
   ]);
   const total = summary.total;
   const byCategory = summary.byCategory.slice(0, 6);
@@ -2801,7 +2808,7 @@ async function maybeSendMonthlyExpenseReport(env: Env): Promise<void> {
   const start = `${monthKey}-01T00:00:00+09:00`;
   const end = `${monthKey}-${pad(parts.day)}T23:59:59+09:00`;
   const [summary, rows] = await Promise.all([
-    summarizeExpenseRange(env, "month"),
+    summarizeExpenseRange(env, "month", EXPENSE_CATEGORY_CONFIG),
     env.DB.prepare(
       `SELECT id, amount, category, memo, store, spent_at, created_at
        FROM expenses
@@ -2813,7 +2820,7 @@ async function maybeSendMonthlyExpenseReport(env: Env): Promise<void> {
   const total = summary.total;
   const byCategory = summary.byCategory;
   const ai = await monthlyExpenseAiComment(env, monthKey, total, byCategory, expenses.slice(-5));
-  const hierarchy = buildExpenseHierarchyParts(expenses, EXPENSE_CATEGORIES, 5, summary);
+  const hierarchy = buildExpenseHierarchyParts(expenses, EXPENSE_CATEGORY_CONFIG, 5, summary);
   const message = fitDiscordContent({
     header: [ai || `先生、${monthKey}の支出レポートです。消費は計画的に、ですよ。`, "", ...hierarchy.header, ...(expenses.length ? [] : ["記録された支出はありません。"])],
     sections: hierarchy.sections
@@ -2988,7 +2995,7 @@ function prepareExpenseRangeQuery(env: Env, query: string, dateRange: ExpenseDat
   return dateRange ? statement.bind(dateRange.start, dateRange.end) : statement;
 }
 
-async function summarizeExpenseRange(env: Env, range: string): Promise<ExpenseSummary> {
+async function summarizeExpenseRange(env: Env, range: string, config: CategoryConfig): Promise<ExpenseSummary> {
   const dateRange = expenseDateRange(env, range);
   const where = dateRange ? " WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)" : "";
   const [totalRow, groupedRows] = await Promise.all([
@@ -2999,12 +3006,12 @@ async function summarizeExpenseRange(env: Env, range: string): Promise<ExpenseSu
   ]);
   const totals = new Map<string, number>();
   for (const row of groupedRows.results ?? []) {
-    const category = normalizeExpenseCategory(row.category, EXPENSE_CATEGORIES);
+    const category = normalizeExpenseCategory(row.category, config);
     totals.set(category, (totals.get(category) ?? 0) + Number(row.total ?? 0));
   }
   return {
     total: Number(totalRow?.total ?? 0),
-    byCategory: EXPENSE_CATEGORIES
+    byCategory: config.categories
       .filter((category) => totals.has(category))
       .map((category) => ({ category, total: totals.get(category) ?? 0 }))
   };
@@ -3343,7 +3350,7 @@ function formatExpenseCandidate(
   spentAt: string | null = null
 ): string {
   return [
-    `大分類: ${normalizeExpenseCategory(category, EXPENSE_CATEGORIES)}`,
+    `大分類: ${normalizeExpenseCategory(category, EXPENSE_CATEGORY_CONFIG)}`,
     `品物: ${memo || "未設定"}`,
     `店: ${store || "未設定"}`,
     `金額: ${amount.toLocaleString("ja-JP")}円`,
@@ -3355,7 +3362,7 @@ function formatExpenses(rows: ExpenseRow[], range: string, env: Env, summary: Ex
   const title = range === "all" ? "支出メモ (all / 直近10件)" : "支出メモ (今月 / 直近10件)";
   if (!rows.length) return `${title}: なし`;
   const visible = rows.slice(0, 10);
-  const hierarchy = buildExpenseHierarchyParts(visible, EXPENSE_CATEGORIES, undefined, summary);
+  const hierarchy = buildExpenseHierarchyParts(visible, EXPENSE_CATEGORY_CONFIG, undefined, summary);
   return fitDiscordContent({
     header: [title, ...hierarchy.header],
     sections: hierarchy.sections
@@ -3666,7 +3673,7 @@ function pendingComponents(id: string, options: { dueButton?: boolean; remindBut
 }
 
 function pendingExpenseComponents(id: string, payload: Record<string, string | number | null>): unknown[] {
-  const current = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORIES);
+  const current = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORY_CONFIG);
   return [
     {
       type: 1,

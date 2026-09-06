@@ -1,6 +1,6 @@
 import expenseCategories from "./expense-categories.json";
 
-const EXPENSE_CATEGORIES = expenseCategories as string[];
+const EXPENSE_CATEGORIES = (expenseCategories as { categories: readonly string[] }).categories;
 
 export const YUUKA_MANUAL = [
   "【ユウカ取扱説明】",
