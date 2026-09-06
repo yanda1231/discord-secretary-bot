@@ -15,6 +15,8 @@ export const expenseAsidesLevel1 = [
 ] as const;
 
 export const YUUKA_PHRASES = {
+  expenseAsides,
+  expenseAsidesLevel1,
   unknownCommand: "先生、そのコマンドは私の管理表にありません。`/guide` で使えるコマンドを確認してください。",
   expiredConfirmation: "先生、この確認は期限切れです。もう一度作り直してください。",
   geminiUnavailable: "先生、今は少し頭がうまく回りません。少し時間をおいて、もう一度話しかけてください。",
