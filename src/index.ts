@@ -917,7 +917,7 @@ async function processExpenseCategorySelect(interaction: DiscordInteraction, env
   const payload = expensePendingPayload(latest);
   return updateMessageWithComponents(
     pendingContent("expense", payload),
-    pendingExpenseComponents(id, payload)
+    pendingExpenseComponents(id, payload, EXPENSE_CATEGORY_CONFIG)
   );
 }
 
@@ -1255,7 +1255,7 @@ async function createPendingPost(env: Env, channelId: string, userId: string, ki
       { type: 2, style: 4, label: cancelLabel, custom_id: `confirm:${id}:cancel` }
     ]
   }] : kind === "expense"
-    ? pendingExpenseComponents(id, payloadWithContent)
+    ? pendingExpenseComponents(id, payloadWithContent, EXPENSE_CATEGORY_CONFIG)
     : pendingComponents(id, pendingComponentOptions(kind, preparedPayload));
   const posted = await postDiscordPayload(env, channelId, {
     content: kind === "todo" || kind === "reminder" || kind === "expense" ? pendingContent(kind, payloadWithContent) : content,
@@ -1827,7 +1827,7 @@ async function handleExpenseCorrection(env: Env, message: DiscordMessage, pendin
   const cardUpdated = cardMessageId
     ? await patchDiscordMessage(env, message.channel_id, cardMessageId, {
       content: fitDiscordContent([pendingContent("expense", latestPayload)], 1900),
-      components: pendingExpenseComponents(latest.id, latestPayload)
+      components: pendingExpenseComponents(latest.id, latestPayload, EXPENSE_CATEGORY_CONFIG)
     })
     : false;
   const response = cardUpdated
@@ -3723,8 +3723,12 @@ function pendingComponents(id: string, options: { dueButton?: boolean; remindBut
   return rows;
 }
 
-function pendingExpenseComponents(id: string, payload: Record<string, string | number | null>): unknown[] {
-  const current = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORY_CONFIG);
+function pendingExpenseComponents(
+  id: string,
+  payload: Record<string, string | number | null>,
+  config: CategoryConfig
+): unknown[] {
+  const current = normalizeExpenseCategory(payload.category, config);
   return [
     {
       type: 1,
@@ -3734,7 +3738,7 @@ function pendingExpenseComponents(id: string, payload: Record<string, string | n
         placeholder: `大分類: ${current}`,
         min_values: 1,
         max_values: 1,
-        options: EXPENSE_CATEGORIES.map((category) => ({
+        options: config.categories.map((category) => ({
           label: category,
           value: category,
           default: category === current
