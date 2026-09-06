@@ -83,6 +83,13 @@ const commands = [
     ]
   },
   {
+    name: "request",
+    description: "機能要望を確認します",
+    options: [
+      { type: 1, name: "list", description: "自分の機能要望一覧を表示します" }
+    ]
+  },
+  {
     name: "guide",
     description: "ユウカに使い方を聞きます"
   },
