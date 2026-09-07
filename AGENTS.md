@@ -6,7 +6,7 @@
 
 - 編集とコミットは git正本 `~/Library/Mobile Documents/com~apple~CloudDocs/自作アプリ/discord-secretary-bot` で行う。
 - `~/dev/discord-secretary-bot` は git 管理外の作業コピー。コミット後に変更ファイルを複写し、`diff -rq` で src・tests・md が一致することを確認する。
-- `git push`・`wrangler deploy`・本番 D1 への書き込みは worker席が行わない。Fable席か安田さんが行う。
+- `git push` は Fable席、`wrangler deploy` は安田さん、本番 D1 への書き込みは Fable席が行う。worker席はコミットまで。
 
 ## 機能を追加・変更したら必ず更新するファイル
 
@@ -36,7 +36,7 @@ grep -rn "INSERT INTO expenses" src   # 1箇所（src/index.ts の recordExpense
 
 ## デプロイと報告文の投稿（Fable席・安田さん向け）
 
-- デプロイ: `cd ~/dev/discord-secretary-bot && npx wrangler deploy`。反映確認は `npx wrangler deployments status` の Created 時刻と Version ID で行う（画面の貼り付けでは判定しない）。
+- デプロイ: 安田さんがターミナルで `cd ~/dev/discord-secretary-bot && npx wrangler deploy` を実行する（Fable席の安全装置が deploy を止めるため）。反映確認は Fable席が `npx wrangler deployments status` の Created 時刻と Version ID で行う（画面の貼り付けでは判定しない）。
 - 報告文の投稿: `DISCORD_BOT_TOKEN="…" node scripts/post-welcome.mjs 1521789822639935528 ANNOUNCE_<日付>.md`。bot トークンはこの Mac に無いので安田さんが実行する。
 - スラッシュコマンドを追加・変更したら `npm run register` も必要。
 
