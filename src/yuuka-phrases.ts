@@ -17,6 +17,10 @@ export const expenseAsidesLevel1 = [
 export const YUUKA_PHRASES = {
   expenseAsides,
   expenseAsidesLevel1,
+  receiptRead: "レシートから読み取りました。",
+  receiptOneAtATime: "写真は1枚ずつ貼ってください。",
+  receiptUnreadable: "レシートは分かったけど合計が読めませんでした。合計が写るように撮り直すか、金額を文で教えてください。",
+  receiptFetchError: "写真を受け取れませんでした。",
   unknownCommand: "先生、そのコマンドは私の管理表にありません。`/guide` で使えるコマンドを確認してください。",
   expiredConfirmation: "先生、この確認は期限切れです。もう一度作り直してください。",
   geminiUnavailable: "先生、今は少し頭がうまく回りません。少し時間をおいて、もう一度話しかけてください。",

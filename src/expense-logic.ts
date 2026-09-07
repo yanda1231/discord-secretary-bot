@@ -187,6 +187,22 @@ export function normalizeExpenseCategory(value: unknown, config: CategoryConfig)
     ?? "その他";
 }
 
+export function normalizeExpenseMemo(content: string, category: string | null): string {
+  const memo = content.trim();
+  if (!memo) return category ? `${category}の支出` : "支出";
+  if (category && memo === category) return `${memo}を購入`;
+  if (/^[\p{L}\p{N}ー・]+$/u.test(memo) && !/(代|費|購入|課金|支払|買|食|飲)/.test(memo)) {
+    return `${memo}を購入`;
+  }
+  return memo;
+}
+
+/** Limit only the confirmation-card projection; the stored memo remains unchanged. */
+export function truncateExpenseMemoForDisplay(content: string, max = 200): string {
+  const chars = [...content];
+  return chars.length > max ? `${chars.slice(0, max).join("")}…` : content;
+}
+
 function cleanCorrectionValue(value: string): string {
   return value
     .trim()
