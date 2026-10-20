@@ -29,7 +29,7 @@ import {
   REQUEST_DETAILS_UPDATE_SQL
 } from "../src/request-logic.ts";
 import { expenseAiComment } from "../src/expense-comment.ts";
-import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2 } from "../src/yuuka-phrases.ts";
+import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3 } from "../src/yuuka-phrases.ts";
 
 const categoryConfig: CategoryConfig = {
   categories: ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"],
@@ -235,15 +235,35 @@ test("支出コメント生成は空応答・例外時に各段階の定型へ�
   const loadPersona = async (): Promise<string> => "テスト用ユウカ";
   const empty = async (): Promise<string> => "";
   assert.ok(expenseAsidesLevel1.includes(await expenseAiComment(1, 10_000, "趣味", "本", null, loadPersona, empty)));
-  assert.deepEqual(await expenseAiComment(2, 20_000, "趣味", "本", null, loadPersona, empty), expenseAsidesLevel2[0]);
-  assert.equal(
-    await expenseAiComment(3, 40_000, "趣味", "本", null, loadPersona, empty),
-    "先生！？ その支出額は会計担当として見過ごせません。まずは記録して、あとで予算を再計算しますよ。"
-  );
+  assert.ok(expenseAsidesLevel2.includes(await expenseAiComment(2, 20_000, "趣味", "本", null, loadPersona, empty)));
+  assert.ok(expenseAsidesLevel3.includes(await expenseAiComment(3, 40_000, "趣味", "本", null, loadPersona, empty)));
   const throws = async (): Promise<string> => {
     throw new Error("test failure");
   };
-  assert.deepEqual(await expenseAiComment(2, 20_000, "趣味", "本", null, loadPersona, throws), expenseAsidesLevel2[0]);
+  assert.ok(expenseAsidesLevel2.includes(await expenseAiComment(2, 20_000, "趣味", "本", null, loadPersona, throws)));
+});
+
+test("段階1・2の指示文は予備文を例として含み、段階3は含めない", async () => {
+  const prompts: string[] = [];
+  const loadPersona = async (): Promise<string> => "テスト用ユウカ";
+  const generate = async (prompt: string): Promise<string> => {
+    prompts.push(prompt);
+    return "生成した一言。";
+  };
+
+  await expenseAiComment(1, 10_000, "趣味", "本", null, loadPersona, generate);
+  assert.match(prompts[0], new RegExp(expenseAsidesLevel1[0]));
+  assert.match(prompts[0], new RegExp(expenseAsidesLevel1[1]));
+  assert.match(prompts[0], /言い回しは例文と変え、自分の言葉で書く/);
+
+  await expenseAiComment(2, 20_000, "趣味", "本", null, loadPersona, generate);
+  assert.match(prompts[1], new RegExp(expenseAsidesLevel2[0]));
+  assert.match(prompts[1], new RegExp(expenseAsidesLevel2[1]));
+  assert.match(prompts[1], /言い回しは例文と変え、自分の言葉で書く/);
+
+  await expenseAiComment(3, 40_000, "趣味", "本", null, loadPersona, generate);
+  assert.doesNotMatch(prompts[2], new RegExp(expenseAsidesLevel3[0]));
+  assert.doesNotMatch(prompts[2], /言い回しは例文と変え、自分の言葉で書く/);
 });
 
 test("月の入力は年月・日付・月名を正規化し、境界外を無効にする", () => {
@@ -303,10 +323,21 @@ test("完全な支出候補がある時だけ通常の雑談返信を落とし�
   assert.deepEqual(dropChatReplyWhenExpenseCard([chat]), [chat]);
 });
 
-test("支出コメントの定型文は評価や忠告を含めず句点で終わる", () => {
-  for (const phrase of [...expenseAsides, ...expenseAsidesLevel1, ...expenseAsidesLevel2]) {
+test("支出コメントの定型文は段階ごとの本数と禁止語を守る", () => {
+  assert.equal(expenseAsides.length, 7);
+  assert.equal(expenseAsidesLevel1.length, 5);
+  assert.equal(expenseAsidesLevel2.length, 5);
+  assert.equal(expenseAsidesLevel3.length, 5);
+  for (const phrase of expenseAsides) {
     assert.match(phrase, /。$/);
-    assert.doesNotMatch(phrase, /小言|計画的|積もれば|感謝|！|？/);
+    assert.doesNotMatch(phrase, /小言|感謝|！|？/);
+  }
+  for (const phrase of [...expenseAsidesLevel1, ...expenseAsidesLevel2]) {
+    assert.match(phrase, /。$/);
+    assert.doesNotMatch(phrase, /！|？/);
+  }
+  for (const phrase of expenseAsidesLevel3) {
+    assert.match(phrase, /。$/);
   }
 });
 

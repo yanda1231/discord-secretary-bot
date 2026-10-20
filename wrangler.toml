@@ -1,5 +1,6 @@
 name = "discord-secretary-bot"
 main = "src/index.ts"
+account_id = "75e59b4361c492dc9a29c164f05f8d88"
 compatibility_date = "2026-07-01"
 
 [vars]

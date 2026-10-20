@@ -1,4 +1,4 @@
-import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2 } from "./yuuka-phrases.ts";
+import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3 } from "./yuuka-phrases.ts";
 import type { ScoldLevel } from "./expense-logic.ts";
 
 export type ExpenseCommentGenerator = (prompt: string, temperature: number) => Promise<string>;
@@ -26,13 +26,13 @@ export async function expenseAiComment(
     ? () => randomItem(expenseAsidesLevel1)
     : level === 2
       ? () => randomItem(expenseAsidesLevel2)
-      : () => "先生！？ その支出額は会計担当として見過ごせません。まずは記録して、あとで予算を再計算しますよ。";
+      : () => randomItem(expenseAsidesLevel3);
   try {
     const persona = await loadPersona();
     const instruction = level === 1
-      ? "趣味の支出に、ため息ひとつ分の軽口を1文だけ添える。丁寧語で、文末は「。」で閉じる。文の後半で、記録することを肯定して終える。"
+      ? `趣味の支出だと気づいた一言を添える。内容は、趣味だと気づいたことと、記録を引き受けることの2点だけ。強さは次の例と同じ。「${expenseAsidesLevel1[0]}」「${expenseAsidesLevel1[1]}」言い回しは例文と変え、自分の言葉で書く。ため息ひとつ分の間を置いてよい。2文まで、丁寧語、文末は「。」で閉じる。`
       : level === 2
-        ? "趣味で大きめの金額。会計担当として、心配そうに苦言を丁寧語で1文はっきり言う。続く1文で、記録できたことを認める。全体で2文、文末はすべて「。」で閉じる。"
+        ? `趣味で大きめの金額。責めずに、少し心配だと伝える一言を1文。続く1文で記録を引き受け、予算を一緒に見直す提案で締める。強さは次の例と同じ。「${expenseAsidesLevel2[0]}」「${expenseAsidesLevel2[1]}」言い回しは例文と変え、自分の言葉で書く。全体で2文、丁寧語、文末は「。」で閉じる。`
         : "趣味で高額。会計担当として本気で叱る。2〜3文。机を叩く勢い可。最後は記録できたことを認めて次の一歩へ。";
     const answer = await generate([
       persona,
