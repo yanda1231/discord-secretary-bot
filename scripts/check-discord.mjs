@@ -1,5 +1,5 @@
 // ユウカ反映確認: 登録済みスラッシュコマンドと #雑談 の直近投稿を Discord API で読み、結果をファイルに書く（読み取りのみ）
-// 使い方: DISCORD_BOT_TOKEN=... DISCORD_APPLICATION_ID=... [DISCORD_GUILD_ID=...] node check_discord.mjs
+// 使い方: cd ~/dev/discord-secretary-bot && DISCORD_BOT_TOKEN=... DISCORD_APPLICATION_ID=... [DISCORD_GUILD_ID=...] node scripts/check-discord.mjs（結果は ./discord_check_result.json）
 const { DISCORD_BOT_TOKEN: token, DISCORD_APPLICATION_ID: app, DISCORD_GUILD_ID: guild } = process.env;
 if (!token || !app) { console.error("DISCORD_BOT_TOKEN と DISCORD_APPLICATION_ID が必要です"); process.exit(1); }
 const H = { Authorization: `Bot ${token}` };

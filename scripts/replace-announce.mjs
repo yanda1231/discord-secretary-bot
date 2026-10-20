@@ -1,5 +1,5 @@
 // 告知の差し替え: #雑談 にある bot 自身の「先生、2つ直しました」投稿を削除し、指定ファイルの本文を新しく投稿する
-// 使い方: DISCORD_BOT_TOKEN=... node replace_announce.mjs <新しい告知ファイル>
+// 使い方: cd ~/dev/discord-secretary-bot && DISCORD_BOT_TOKEN=... node scripts/replace-announce.mjs <新しい告知ファイル>
 const token = process.env.DISCORD_BOT_TOKEN; const file = process.argv[2];
 if (!token || !file) { console.error("DISCORD_BOT_TOKEN と 告知ファイルが必要です"); process.exit(1); }
 const fs = await import("node:fs"); const content = fs.readFileSync(file, "utf8").trim();
