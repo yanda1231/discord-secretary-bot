@@ -11,3 +11,6 @@ dist
 
 # owner-only doc (not for public repo)
 MIGRATION_OWNER_GUIDE.ja.md
+
+# check-discord.mjs の出力
+discord_check_result.json
