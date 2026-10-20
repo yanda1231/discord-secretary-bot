@@ -5,10 +5,12 @@ import {
   dropChatReplyWhenExpenseCard,
   expenseRangeBounds,
   findCategoryDesignation,
+  findPlannedPurchaseDesignation,
   fitDiscordContent,
   formatExpenseHierarchy,
   hasCorrectionCue,
   isExpenseCandidateComplete,
+  isPlannedPayload,
   normalizeExpenseCategory,
   parseExpenseCorrection,
   parseExpenseMonth,
@@ -18,6 +20,7 @@ import {
   SCOLD_LEVEL2_MIN_AMOUNT,
   SCOLD_LEVEL3_MIN_AMOUNT,
   scoldLevel,
+  splitPlannedCorrection,
   type CategoryConfig
 } from "../src/expense-logic.ts";
 import {
@@ -29,7 +32,7 @@ import {
   REQUEST_DETAILS_UPDATE_SQL
 } from "../src/request-logic.ts";
 import { expenseAiComment } from "../src/expense-comment.ts";
-import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3 } from "../src/yuuka-phrases.ts";
+import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3, expenseAsidesPlanned } from "../src/yuuka-phrases.ts";
 
 const categoryConfig: CategoryConfig = {
   categories: ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"],
@@ -39,7 +42,8 @@ const categoryConfig: CategoryConfig = {
     "書籍": "趣味",
     "交際": "交際費",
     "医療": "医療費"
-  }
+  },
+  plannedWords: ["計画購入", "計画買い", "貯金から", "積立から", "貯めた分", "貯めてた分", "貯めていた分", "予定どおり", "予定通り"]
 };
 
 test("機能要望の決定論トリガーは取消・先頭・含有の順で解決する", () => {
@@ -181,6 +185,27 @@ test("旧分類別名は正規化時だけ新分類へ対応付ける", () => {
   assert.equal(normalizeExpenseCategory("食費", categoryConfig), "食費");
 });
 
+test("計画購入の宣言は本文と訂正の残りを決定論で分ける", () => {
+  assert.equal(findPlannedPurchaseDesignation("計画購入 グラボ 45000円", categoryConfig), true);
+  assert.equal(findPlannedPurchaseDesignation("貯金からです", categoryConfig), true);
+  assert.equal(findPlannedPurchaseDesignation("予定どおりに買った", categoryConfig), true);
+  assert.equal(findPlannedPurchaseDesignation("計画購入", categoryConfig), true);
+  assert.equal(findPlannedPurchaseDesignation("計画を立てる", categoryConfig), false);
+  assert.equal(findPlannedPurchaseDesignation("貯金が減った", categoryConfig), false);
+  assert.equal(findPlannedPurchaseDesignation("", categoryConfig), false);
+
+  assert.deepEqual(splitPlannedCorrection("計画購入", categoryConfig), { planned: true, rest: "" });
+  const categoryCorrection = splitPlannedCorrection("雑費にして 計画購入", categoryConfig);
+  assert.deepEqual(categoryCorrection, { planned: true, rest: "雑費にして" });
+  assert.deepEqual(parseExpenseCorrection(categoryCorrection.rest, categoryConfig), { category: "雑費" });
+  assert.deepEqual(splitPlannedCorrection("５００円だった", categoryConfig), { planned: false, rest: "500円だった" });
+  assert.equal(isPlannedPayload(JSON.parse(JSON.stringify({ planned: 1 }))), true);
+  assert.equal(isPlannedPayload({ planned: 0 }), false);
+  assert.equal(isPlannedPayload({}), false);
+  assert.equal(isPlannedPayload({ planned: "1" }), true);
+  assert.equal(isPlannedPayload({ planned: "yes" }), false);
+});
+
 test("支出訂正の決定論パーサー", () => {
   assert.deepEqual(parseExpenseCorrection("雑費にして", categoryConfig), { category: "雑費" });
   assert.deepEqual(parseExpenseCorrection("書籍にして", categoryConfig), { category: "趣味" });
@@ -229,6 +254,23 @@ test("支出コメント生成は尺度0でAIを呼ばず、尺度1〜3で1回�
   assert.equal(calls, 2);
   await expenseAiComment(3, 40_000, "趣味", "ゲーム機", "店", loadPersona, generate);
   assert.equal(calls, 3);
+});
+
+test("計画購入の支出コメントは金額に関係なく定型文だけで返す", async () => {
+  let personaCalls = 0;
+  let generateCalls = 0;
+  const loadPersona = async (): Promise<string> => {
+    personaCalls += 1;
+    return "テスト用ユウカ";
+  };
+  const generate = async (): Promise<string> => {
+    generateCalls += 1;
+    return "AIの一言。";
+  };
+  const answer = await expenseAiComment(3, 40_000, "趣味", "本", null, loadPersona, generate, true);
+  assert.ok(expenseAsidesPlanned.includes(answer));
+  assert.equal(personaCalls, 0);
+  assert.equal(generateCalls, 0);
 });
 
 test("支出コメント生成は空応答・例外時に各段階の定型へ戻る", async () => {
@@ -325,12 +367,17 @@ test("完全な支出候補がある時だけ通常の雑談返信を落とし�
 
 test("支出コメントの定型文は段階ごとの本数と禁止語を守る", () => {
   assert.equal(expenseAsides.length, 7);
+  assert.equal(expenseAsidesPlanned.length, 5);
   assert.equal(expenseAsidesLevel1.length, 5);
   assert.equal(expenseAsidesLevel2.length, 5);
   assert.equal(expenseAsidesLevel3.length, 5);
   for (const phrase of expenseAsides) {
     assert.match(phrase, /。$/);
     assert.doesNotMatch(phrase, /小言|感謝|！|？/);
+  }
+  for (const phrase of expenseAsidesPlanned) {
+    assert.match(phrase, /。$/);
+    assert.doesNotMatch(phrase, /！|？|小言/);
   }
   for (const phrase of [...expenseAsidesLevel1, ...expenseAsidesLevel2]) {
     assert.match(phrase, /。$/);

@@ -13,6 +13,7 @@ import {
   dropChatReplyWhenExpenseCard,
   expenseRangeBounds,
   findCategoryDesignation,
+  findPlannedPurchaseDesignation,
   fitDiscordContent,
   hasCorrectionCue,
   isExpenseCandidateComplete,
@@ -20,10 +21,12 @@ import {
   normalizeExpenseCategory,
   normalizeExpenseMemo,
   truncateExpenseMemoForDisplay,
+  isPlannedPayload,
   parseExpenseCorrection,
   resolveCorrectionTarget,
   resolveExpenseRange,
   scoldLevel,
+  splitPlannedCorrection,
   type ScoldLevel,
   type CategoryConfig,
   type CorrectionTargetDecision,
@@ -46,7 +49,11 @@ import {
 import { YUUKA_MANUAL } from "./yuuka-manual";
 import expenseCategories from "./expense-categories.json";
 
-const EXPENSE_CATEGORY_CONFIG = expenseCategories as CategoryConfig;
+const EXPENSE_CATEGORY_CONFIG: CategoryConfig = {
+  categories: expenseCategories.categories,
+  aliases: expenseCategories.aliases,
+  plannedWords: expenseCategories.planned_words
+};
 const EXPENSE_CATEGORIES = EXPENSE_CATEGORY_CONFIG.categories;
 
 export interface Env {
@@ -224,6 +231,7 @@ type ChatEvent = {
   reminder_id?: number | null;
   amount?: number | null;
   category?: string | null;
+  planned?: boolean;
   item?: string | null;
   store?: string | null;
   confidence?: "high" | "medium" | "low";
@@ -926,7 +934,7 @@ async function processExpenseCategorySelect(interaction: DiscordInteraction, env
   const categoryChanged = previousCategory !== category;
   let expression = "json_set(payload, '$.category', ?)";
   const bindings: (string | number | null)[] = [category];
-  if (categoryChanged) {
+  if (categoryChanged && !isPlannedPayload(previousPayload)) {
     const aiComment = await expenseAiComment(
       env,
       scoldLevel(category, amount),
@@ -1804,18 +1812,21 @@ async function handleExpenseCorrection(env: Env, message: DiscordMessage, pendin
     return;
   }
 
-  let correction = parseExpenseCorrection(message.content, EXPENSE_CATEGORY_CONFIG);
-  if (!correctionFieldEntries(correction).length) {
-    correction = await parseExpenseCorrectionWithAi(env, message.content, payload);
+  const plannedCorrection = splitPlannedCorrection(message.content, EXPENSE_CATEGORY_CONFIG);
+  let correction = parseExpenseCorrection(plannedCorrection.rest, EXPENSE_CATEGORY_CONFIG);
+  if (!correctionFieldEntries(correction).length && plannedCorrection.rest) {
+    correction = await parseExpenseCorrectionWithAi(env, plannedCorrection.rest, payload);
   }
   const entries = correctionFieldEntries(correction);
-  if (!entries.length) {
+  if (!entries.length && !plannedCorrection.planned) {
     await postDiscordReply(env, message.channel_id, message.id, "どこを直すか読み取れませんでした。大分類・品物・店・金額のどれかを教えてください。");
     return;
   }
 
   const nextPayload = { ...payload };
   for (const [key, value] of entries) nextPayload[key] = value;
+  const previousPlanned = isPlannedPayload(payload);
+  const plannedAdded = plannedCorrection.planned && !previousPlanned;
   const previousCategory = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORY_CONFIG);
   const nextCategory = normalizeExpenseCategory(nextPayload.category, EXPENSE_CATEGORY_CONFIG);
   const previousAmount = Math.max(0, Math.round(Number(payload.amount ?? 0)));
@@ -1827,7 +1838,23 @@ async function handleExpenseCorrection(env: Env, message: DiscordMessage, pendin
     expression = `json_set(${expression}, '$.${key}', ?)`;
     bindings.push(value);
   }
-  if (categoryOrAmountChanged) {
+  if (plannedAdded) {
+    expression = `json_set(${expression}, '$.planned', ?)`;
+    bindings.push(1);
+  }
+  if (plannedAdded) {
+    const plannedAside = await expenseAiComment(
+      env,
+      scoldLevel(nextCategory, nextAmount),
+      nextAmount,
+      nextCategory,
+      String(nextPayload.memo ?? nextPayload.item ?? nextPayload.content ?? ""),
+      stringOrNull(nextPayload.store),
+      true
+    );
+    expression = `json_set(${expression}, '$.ai_comment', ?)`;
+    bindings.push(plannedAside);
+  } else if (!previousPlanned && categoryOrAmountChanged) {
     const aiComment = await expenseAiComment(
       env,
       scoldLevel(nextCategory, nextAmount),
@@ -1863,9 +1890,13 @@ async function handleExpenseCorrection(env: Env, message: DiscordMessage, pendin
       components: pendingExpenseComponents(latest.id, latestPayload, EXPENSE_CATEGORY_CONFIG)
     })
     : false;
+  const correctionReply = entries.length ? expenseCorrectionReply(correction) : "計画購入として受け取りました。";
+  const responseText = plannedCorrection.planned && entries.length
+    ? `${correctionReply}\n計画購入として受け取りました。`
+    : correctionReply;
   const response = cardUpdated
-    ? expenseCorrectionReply(correction)
-    : `${expenseCorrectionReply(correction)} 保存はしましたがカードの表示更新に失敗しました。記録するを押すと保存内容で記録されます。`;
+    ? responseText
+    : `${responseText} 保存はしましたがカードの表示更新に失敗しました。記録するを押すと保存内容で記録されます。`;
   await postDiscordReply(env, message.channel_id, message.id, response);
 }
 
@@ -1875,7 +1906,8 @@ async function handleReceiptAttachment(
   env: Env,
   message: DiscordMessage,
   attachment: ReceiptAttachment,
-  categoryHint: string | null
+  categoryHint: string | null,
+  planned = false
 ): Promise<ReceiptMessageResult> {
   try {
     const { imageBase64, mimeType } = await fetchReceiptImage(attachment);
@@ -1890,13 +1922,13 @@ async function handleReceiptAttachment(
     });
     const amount = payload.amount;
     const category = normalizeExpenseCategory(payload.category, EXPENSE_CATEGORY_CONFIG);
-    const aside = await expenseAiComment(env, scoldLevel(category, amount), amount, category, payload.memo, payload.store || null);
+    const aside = await expenseAiComment(env, scoldLevel(category, amount), amount, category, payload.memo, payload.store || null, planned);
     await createPendingPost(
       env,
       message.channel_id,
       message.author.id,
       "expense",
-      { ...payload, category, ai_comment: aside },
+      { ...payload, category, ...(planned ? { planned: 1 } : {}), ai_comment: aside },
       [
         YUUKA_PHRASES.receiptRead,
         aside,
@@ -1944,7 +1976,8 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
 
   if (receiptAttachment) {
     const categoryHint = text ? findCategoryDesignation(text, EXPENSE_CATEGORY_CONFIG) : null;
-    const receiptResult = await handleReceiptAttachment(env, message, receiptAttachment, categoryHint);
+    const planned = text ? findPlannedPurchaseDesignation(text, EXPENSE_CATEGORY_CONFIG) : false;
+    const receiptResult = await handleReceiptAttachment(env, message, receiptAttachment, categoryHint, planned);
     if (receiptResult === "ok") return;
     if (receiptResult === "unreadable") {
       await postDiscordReply(env, message.channel_id, message.id, YUUKA_PHRASES.receiptUnreadable);
@@ -2060,7 +2093,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
       const item = String(event.item ?? event.content).trim();
       const memo = normalizeExpenseMemo(item, category);
       const store = stringOrNull(event.store);
-      const aside = await expenseAiComment(env, scoldLevel(category, amount), amount, category, memo, store);
+      const aside = await expenseAiComment(env, scoldLevel(category, amount), amount, category, memo, store, event.planned === true);
       await createPendingPost(
         env,
         message.channel_id,
@@ -2072,6 +2105,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
           item,
           memo,
           store,
+          ...(event.planned ? { planned: 1 } : {}),
           ai_comment: aside,
           spent_at: event.datetime ?? new Date().toISOString()
         },
@@ -2379,8 +2413,15 @@ async function classifyChatEvents(
       : event);
     const expenseEvents = events.filter((event) => event.type === "expense_candidate");
     const designation = findCategoryDesignation(text, config);
-    if (designation && expenseEvents.length === 1) {
-      events = events.map((event) => event.type === "expense_candidate" ? { ...event, category: designation } : event);
+    const planned = findPlannedPurchaseDesignation(text, config);
+    if (expenseEvents.length) {
+      events = events.map((event) => event.type === "expense_candidate"
+        ? {
+          ...event,
+          ...(designation && expenseEvents.length === 1 ? { category: designation } : {}),
+          planned
+        }
+        : event);
     }
     return events;
   } catch (error) {
@@ -2437,6 +2478,26 @@ async function chatReplyWithContext(
   }
 }
 
+export function expenseAiComment(
+  env: Env,
+  level: ScoldLevel,
+  amount: number,
+  category: string | null,
+  memo: string,
+  store: string | null,
+  planned?: boolean,
+  generate?: ExpenseCommentGenerator
+): Promise<string>;
+export function expenseAiComment(
+  env: Env,
+  level: ScoldLevel,
+  amount: number,
+  category: string | null,
+  memo: string,
+  store: string | null,
+  generate: ExpenseCommentGenerator,
+  planned?: boolean
+): Promise<string>;
 export async function expenseAiComment(
   env: Env,
   level: ScoldLevel,
@@ -2444,8 +2505,17 @@ export async function expenseAiComment(
   category: string | null,
   memo: string,
   store: string | null,
-  generate: ExpenseCommentGenerator = (prompt, temperature) => geminiText(env, prompt, temperature)
+  plannedOrGenerate: boolean | ExpenseCommentGenerator = false,
+  generateOrPlanned?: ExpenseCommentGenerator | boolean
 ): Promise<string> {
+  const planned = typeof plannedOrGenerate === "boolean"
+    ? plannedOrGenerate
+    : typeof generateOrPlanned === "boolean" ? generateOrPlanned : false;
+  const generate = typeof plannedOrGenerate === "function"
+    ? plannedOrGenerate
+    : typeof generateOrPlanned === "function"
+      ? generateOrPlanned
+      : (prompt: string, temperature: number) => geminiText(env, prompt, temperature);
   return buildExpenseAiComment(
     level,
     amount,
@@ -2453,7 +2523,8 @@ export async function expenseAiComment(
     memo,
     store,
     () => loadPersona(env).then((persona) => personaPrompt(persona)),
-    generate
+    generate,
+    planned
   );
 }
 

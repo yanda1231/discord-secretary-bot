@@ -1,4 +1,4 @@
-import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3 } from "./yuuka-phrases.ts";
+import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3, expenseAsidesPlanned } from "./yuuka-phrases.ts";
 import type { ScoldLevel } from "./expense-logic.ts";
 
 export type ExpenseCommentGenerator = (prompt: string, temperature: number) => Promise<string>;
@@ -11,15 +11,46 @@ function randomItem<T>(items: readonly T[]): T {
 }
 
 /** Build the expense aside after deterministic code has selected its scold level. */
-export async function expenseAiComment(
+export function expenseAiComment(
   level: ScoldLevel,
   amount: number,
   category: string | null,
   memo: string,
   store: string | null,
   loadPersona: ExpenseCommentPersonaLoader,
+  generate: ExpenseCommentGenerator,
+  planned?: boolean
+): Promise<string>;
+export function expenseAiComment(
+  level: ScoldLevel,
+  amount: number,
+  category: string | null,
+  memo: string,
+  store: string | null,
+  planned: boolean,
+  loadPersona: ExpenseCommentPersonaLoader,
   generate: ExpenseCommentGenerator
+): Promise<string>;
+export async function expenseAiComment(
+  level: ScoldLevel,
+  amount: number,
+  category: string | null,
+  memo: string,
+  store: string | null,
+  loadPersonaOrPlanned: ExpenseCommentPersonaLoader | boolean,
+  generateOrLoadPersona: ExpenseCommentGenerator | ExpenseCommentPersonaLoader,
+  plannedOrGenerate?: boolean | ExpenseCommentGenerator
 ): Promise<string> {
+  const planned = typeof loadPersonaOrPlanned === "boolean"
+    ? loadPersonaOrPlanned
+    : typeof plannedOrGenerate === "boolean" ? plannedOrGenerate : false;
+  const loadPersona = typeof loadPersonaOrPlanned === "boolean"
+    ? generateOrLoadPersona as ExpenseCommentPersonaLoader
+    : loadPersonaOrPlanned;
+  const generate = typeof loadPersonaOrPlanned === "boolean"
+    ? plannedOrGenerate as ExpenseCommentGenerator
+    : generateOrLoadPersona as ExpenseCommentGenerator;
+  if (planned) return randomItem(expenseAsidesPlanned);
   if (level === 0) return randomItem(expenseAsides);
 
   const fallback = level === 1

@@ -9,6 +9,7 @@ export type ExpenseCorrection = {
 export type CategoryConfig = {
   categories: readonly string[];
   aliases: Readonly<Record<string, string>>;
+  plannedWords?: readonly string[];
 };
 
 export const SCOLD_LEVEL1_MIN_AMOUNT = 10_000;
@@ -316,6 +317,38 @@ function cleanCorrectionValue(value: string): string {
     .replace(/^[：:＝=\s]+/, "")
     .replace(/[、。，,・]+$/, "")
     .trim();
+}
+
+function plannedWords(config: CategoryConfig): string[] {
+  return (config.plannedWords ?? [])
+    .map((word) => word.normalize("NFKC").trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+}
+
+/** Find the deterministic words that declare a purchase was planned. */
+export function findPlannedPurchaseDesignation(text: string, config: CategoryConfig): boolean {
+  const normalized = text.normalize("NFKC");
+  return plannedWords(config).some((word) => normalized.includes(word));
+}
+
+/** Remove every planned-purchase declaration before the existing correction parser sees the rest. */
+export function splitPlannedCorrection(text: string, config: CategoryConfig): { planned: boolean; rest: string } {
+  const normalized = text.normalize("NFKC");
+  const words = plannedWords(config);
+  if (!words.length) return { planned: false, rest: normalized.trim() };
+  const pattern = new RegExp(words.map(escapeRegExp).join("|"), "g");
+  const planned = pattern.test(normalized);
+  pattern.lastIndex = 0;
+  const rest = normalized
+    .replace(pattern, "")
+    .replace(/^[\s、。，,・]+|[\s、。，,・]+$/g, "")
+    .trim();
+  return { planned, rest };
+}
+
+export function isPlannedPayload(payload: Record<string, unknown>): boolean {
+  return Number(payload.planned) === 1;
 }
 
 function correctionField(text: string, pattern: RegExp): string | undefined {
