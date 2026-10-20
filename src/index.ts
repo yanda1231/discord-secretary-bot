@@ -3585,7 +3585,12 @@ function formatExpenses(rows: ExpenseRow[], range: ExpenseRangeSpec, env: Env, s
   const title = range.kind === "all"
     ? "支出メモ (全期間 / 直近10件)"
     : `支出メモ (${range.year}年${range.month}月 / 直近10件)`;
-  if (!rows.length) return `${title}: なし`;
+  if (!rows.length) {
+    const emptyTitle = range.kind === "all"
+      ? "支出メモ (全期間)"
+      : `支出メモ (${range.year}年${range.month}月)`;
+    return `${emptyTitle}: なし`;
+  }
   const visible = rows.slice(0, 10);
   const hierarchy = buildExpenseHierarchyParts(visible, EXPENSE_CATEGORY_CONFIG, undefined, summary);
   return fitDiscordContent({
