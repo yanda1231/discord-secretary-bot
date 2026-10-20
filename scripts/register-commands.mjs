@@ -71,12 +71,22 @@ const commands = [
           {
             type: 3,
             name: "range",
-            description: "表示範囲",
+            name_localizations: { ja: "期間" },
+            description: "期間（選ばなければ今月）",
             required: false,
             choices: [
-              { name: "all", value: "all" },
-              { name: "month", value: "month" }
+              { name: "今月", value: "month" },
+              { name: "先月", value: "last_month" },
+              { name: "先々月", value: "two_months_ago" },
+              { name: "全期間", value: "all" }
             ]
+          },
+          {
+            type: 3,
+            name: "month",
+            name_localizations: { ja: "月" },
+            description: "月を指定（例: 2026-07、7月）",
+            required: false
           }
         ]
       }

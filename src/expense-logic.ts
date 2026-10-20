@@ -11,13 +11,120 @@ export type CategoryConfig = {
   aliases: Readonly<Record<string, string>>;
 };
 
-export const SCOLD_LEVEL2_MIN_AMOUNT = 10000;
+export const SCOLD_LEVEL1_MIN_AMOUNT = 10_000;
+export const SCOLD_LEVEL2_MIN_AMOUNT = 20_000;
+export const SCOLD_LEVEL3_MIN_AMOUNT = 40_000;
 
-export type ScoldLevel = 0 | 1 | 2;
+export type ScoldLevel = 0 | 1 | 2 | 3;
 
 export function scoldLevel(category: string | null | undefined, amount: number): ScoldLevel {
-  if (category !== "趣味") return 0;
-  return amount >= SCOLD_LEVEL2_MIN_AMOUNT ? 2 : 1;
+  if (category !== "趣味" || !Number.isFinite(amount) || amount < SCOLD_LEVEL1_MIN_AMOUNT) return 0;
+  if (amount >= SCOLD_LEVEL3_MIN_AMOUNT) return 3;
+  if (amount >= SCOLD_LEVEL2_MIN_AMOUNT) return 2;
+  return 1;
+}
+
+export type ExpenseRangeSpec =
+  | { kind: "all" }
+  | { kind: "month"; year: number; month: number };
+
+export type ExpenseRangeResult = ExpenseRangeSpec | { kind: "invalid" };
+
+type ExpenseMonthToday = { year: number; month: number };
+
+function monthRange(year: number, month: number): ExpenseRangeSpec {
+  return { kind: "month", year, month };
+}
+
+function shiftedMonth(today: ExpenseMonthToday, monthsAgo: number): ExpenseRangeSpec {
+  const date = new Date(Date.UTC(today.year, today.month - 1 - monthsAgo, 1));
+  return monthRange(date.getUTCFullYear(), date.getUTCMonth() + 1);
+}
+
+function validYearMonth(year: number, month: number): ExpenseRangeSpec | null {
+  if (year < 2000 || year > 2099 || month < 1 || month > 12) return null;
+  return monthRange(year, month);
+}
+
+/** Parse a user-entered month without consulting the database or current time. */
+export function parseExpenseMonth(input: string, today: ExpenseMonthToday): ExpenseRangeResult {
+  const normalized = input.normalize("NFKC").trim();
+  if (!normalized) return { kind: "invalid" };
+
+  const delimited = normalized.match(/^(\d{4})([-\/])(\d{1,2})(?:\2\d{1,2})?$/);
+  if (delimited) {
+    const year = Number(delimited[1]);
+    const month = Number(delimited[3]);
+    return validYearMonth(year, month) ?? { kind: "invalid" };
+  }
+
+  const japanese = normalized.match(/^(\d{4})年(\d{1,2})月(?:\d{1,2}日)?$/);
+  if (japanese) {
+    const year = Number(japanese[1]);
+    const month = Number(japanese[2]);
+    return validYearMonth(year, month) ?? { kind: "invalid" };
+  }
+
+  const monthOnly = normalized.match(/^(\d{1,2})月?$/);
+  if (monthOnly) {
+    const month = Number(monthOnly[1]);
+    if (month < 1 || month > 12) return { kind: "invalid" };
+    const year = month > today.month ? today.year - 1 : today.year;
+    return monthRange(year, month);
+  }
+
+  return { kind: "invalid" };
+}
+
+export function resolveExpenseRange(
+  input: { range?: string; month?: string },
+  today: ExpenseMonthToday
+): ExpenseRangeResult {
+  const month = typeof input.month === "string" ? input.month.normalize("NFKC").trim() : "";
+  if (month) return parseExpenseMonth(month, today);
+
+  const range = typeof input.range === "string" ? input.range.normalize("NFKC").trim() : "";
+  if (!range || range === "month") return monthRange(today.year, today.month);
+  if (range === "last_month") return shiftedMonth(today, 1);
+  if (range === "two_months_ago") return shiftedMonth(today, 2);
+  if (range === "all") return { kind: "all" };
+  return { kind: "invalid" };
+}
+
+export type ExpenseDateRange = { start: string; end: string };
+
+export function lastDayOfMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+export function expenseRangeBounds(spec: ExpenseRangeSpec): ExpenseDateRange | null {
+  if (spec.kind === "all") return null;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return {
+    start: `${spec.year}-${pad(spec.month)}-01T00:00:00+09:00`,
+    end: `${spec.year}-${pad(spec.month)}-${pad(lastDayOfMonth(spec.year, spec.month))}T23:59:59+09:00`
+  };
+}
+
+export type ExpenseCandidateEventLike = {
+  type?: string;
+  amount?: number | null;
+  item?: string | null;
+  content?: string | null;
+  request_guidance?: boolean;
+};
+
+export function isExpenseCandidateComplete(event: ExpenseCandidateEventLike): boolean {
+  const item = event.item ?? event.content;
+  return Boolean(event.amount) && typeof item === "string" && item.trim().length > 0;
+}
+
+export function dropChatReplyWhenExpenseCard<T extends ExpenseCandidateEventLike>(events: T[]): T[] {
+  const hasExpenseCard = events.some(
+    (event) => event.type === "expense_candidate" && isExpenseCandidateComplete(event)
+  );
+  if (!hasExpenseCard) return events;
+  return events.filter((event) => event.type !== "chat_reply" || event.request_guidance);
 }
 
 export type CorrectionTargetInput = {

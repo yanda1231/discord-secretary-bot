@@ -1,4 +1,4 @@
-import { expenseAsides, expenseAsidesLevel1 } from "./yuuka-phrases.ts";
+import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2 } from "./yuuka-phrases.ts";
 import type { ScoldLevel } from "./expense-logic.ts";
 
 export type ExpenseCommentGenerator = (prompt: string, temperature: number) => Promise<string>;
@@ -24,12 +24,16 @@ export async function expenseAiComment(
 
   const fallback = level === 1
     ? () => randomItem(expenseAsidesLevel1)
-    : () => "先生！？ その支出額は会計担当として見過ごせません。まずは記録して、あとで予算を再計算しますよ。";
+    : level === 2
+      ? () => randomItem(expenseAsidesLevel2)
+      : () => "先生！？ その支出額は会計担当として見過ごせません。まずは記録して、あとで予算を再計算しますよ。";
   try {
     const persona = await loadPersona();
     const instruction = level === 1
-      ? "趣味の支出への軽い小言を1文。呆れは可、説教は不可。最後に記録を肯定してください。"
-      : "趣味で高額。会計担当として本気で叱る。2〜3文。机を叩く勢い可。最後は記録できたことを認めて次の一歩へ。";
+      ? "趣味の支出に、ため息ひとつ分の軽口を1文だけ添える。丁寧語で、文末は「。」で閉じる。文の後半で、記録することを肯定して終える。"
+      : level === 2
+        ? "趣味で大きめの金額。会計担当として、心配そうに苦言を丁寧語で1文はっきり言う。続く1文で、記録できたことを認める。全体で2文、文末はすべて「。」で閉じる。"
+        : "趣味で高額。会計担当として本気で叱る。2〜3文。机を叩く勢い可。最後は記録できたことを認めて次の一歩へ。";
     const answer = await generate([
       persona,
       "Discordで支出・浪費メモ候補を出す直前に、早瀬ユウカとしてコメントしてください。",
@@ -41,7 +45,7 @@ export async function expenseAiComment(
       `大分類: ${category ?? "その他"}`,
       `品物: ${memo}`,
       `店: ${store ?? "未設定"}`
-    ].join("\n\n"), 0.9);
+    ].join("\n\n"), 0.6);
     return answer.split("\n").map((line) => line.trim()).filter(Boolean).join("\n").slice(0, 260) || fallback();
   } catch (error) {
     console.error("expense ai comment failed", error);

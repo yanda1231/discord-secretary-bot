@@ -10,19 +10,26 @@ import {
 } from "./receipt-logic";
 import {
   buildExpenseHierarchyParts,
+  dropChatReplyWhenExpenseCard,
+  expenseRangeBounds,
   findCategoryDesignation,
   fitDiscordContent,
   hasCorrectionCue,
+  isExpenseCandidateComplete,
+  lastDayOfMonth,
   normalizeExpenseCategory,
   normalizeExpenseMemo,
   truncateExpenseMemoForDisplay,
   parseExpenseCorrection,
   resolveCorrectionTarget,
+  resolveExpenseRange,
   scoldLevel,
   type ScoldLevel,
   type CategoryConfig,
   type CorrectionTargetDecision,
   type ExpenseCorrection,
+  type ExpenseDateRange,
+  type ExpenseRangeSpec,
   type ExpenseSummary
 } from "./expense-logic";
 import {
@@ -257,8 +264,7 @@ const RESPONSE = {
 const EPHEMERAL = 1 << 6;
 const GEMINI_MESSAGE_RETRY_LIMIT = 5;
 const GEMINI_OUTAGE_MINUTES = 30;
-const EXPENSE_CHAT_POLICY = "先生が自分から浪費・使いすぎの話題を出した時だけ、会計担当として叱ってよい。ユウカから支出の話題を持ち出さない";
-const EXPENSE_CHAT_SUPPRESSION = "この発言の支出には別で小言を出すので、ここでは叱らない";
+const EXPENSE_CHAT_POLICY = "支出・浪費の話題では、先生が意見や評価を求めた時だけ、会計担当としての所感を丁寧語で1文述べる。文末は「。」で閉じる。求められていない時は、事実の確認と記録の案内にとどめる。話題は先生が出したものに沿う。";
 
 class GeminiUnavailableError extends Error {
   readonly status?: number;
@@ -424,7 +430,12 @@ async function handleExpenseCommand(interaction: DiscordInteraction, env: Env): 
   if (!sub) return reply("expenseサブコマンドを指定してください。", true);
 
   if (sub.name === "list") {
-    const range = getString(sub, "range") ?? "all";
+    const parts = zonedParts(new Date(), env.TIMEZONE ?? "Asia/Tokyo");
+    const range = resolveExpenseRange(
+      { range: getString(sub, "range"), month: getString(sub, "month") },
+      { year: parts.year, month: parts.month }
+    );
+    if (range.kind === "invalid") return reply("先生、月は 2026-07 か 7月 の形で書いてください。", true);
     const [rows, summary] = await Promise.all([
       listExpenses(env, range),
       summarizeExpenseRange(env, range, EXPENSE_CATEGORY_CONFIG)
@@ -1175,7 +1186,7 @@ function reminderListWithDeleteButtons(reminders: ReminderRow[]): Response {
   });
 }
 
-function expenseListWithDeleteButtons(expenses: ExpenseRow[], range: string, env: Env, summary: ExpenseSummary): Response {
+function expenseListWithDeleteButtons(expenses: ExpenseRow[], range: ExpenseRangeSpec, env: Env, summary: ExpenseSummary): Response {
   if (!expenses.length) return reply(formatExpenses(expenses, range, env, summary), true);
   const targets = expenses.slice(0, 10);
   const rows = [];
@@ -1953,11 +1964,10 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
   }
 
   const events = await classifyChatEvents(env, text, replyChain, EXPENSE_CATEGORY_CONFIG);
-  const actionable = events.filter((event) => event.type !== "none").slice(0, 4);
+  const actionable = dropChatReplyWhenExpenseCard(events.filter((event) => event.type !== "none").slice(0, 4));
   if (!actionable.length && shouldChatReply(text)) {
     actionable.push({ type: "chat_reply", content: text });
   }
-  const hasExpenseCandidate = actionable.some((event) => event.type === "expense_candidate");
 
   let requestGuidanceAdded = false;
   let featureRequestAccepted = false;
@@ -2044,7 +2054,7 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
       continue;
     }
 
-    if (event.type === "expense_candidate" && event.amount && (event.item ?? event.content)) {
+    if (event.type === "expense_candidate" && isExpenseCandidateComplete(event)) {
       const amount = Math.round(Number(event.amount));
       const category = normalizeExpenseCategory(event.category, EXPENSE_CATEGORY_CONFIG);
       const item = String(event.item ?? event.content).trim();
@@ -2079,8 +2089,8 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
       const persona = await loadPersona(env);
       const expenseContext = shouldIncludeExpenseContext(text) ? await buildExpenseContext(env) : "";
       let answer = replyChain.length
-        ? await chatReplyWithContext(env, text, replyChain, expenseContext, hasExpenseCandidate)
-        : event.reply && !expenseContext && !hasExpenseCandidate
+        ? await chatReplyWithContext(env, text, replyChain, expenseContext)
+        : event.reply && !expenseContext
           ? event.reply
           : await geminiText(env, [
             personaPrompt(persona),
@@ -2088,7 +2098,6 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
             "Discordの雑談ルームで、先生に短く自然に返答してください。タスク登録は自動で確定しない。1〜3文。",
             "ユーザーが求めていない限り、雑談を打ち切ったり、別行動へ誘導したりしないでください。",
             EXPENSE_CHAT_POLICY,
-            hasExpenseCandidate ? EXPENSE_CHAT_SUPPRESSION : "",
             expenseContext ? "先生は支出・浪費・予算について話しています。支出状況を踏まえて、会計担当として自然に返してください。数字は支出状況にあるものだけ使い、捏造しないでください。" : "",
             expenseContext,
             `先生の発言: ${text}`
@@ -2333,7 +2342,6 @@ async function classifyChatEvents(
     "feature_request_candidateのcontentは使わず、summaryには先生の発言原文を使う。confidenceがhighでなければchat_replyに変換し、返答末尾に要望の書式案内を1回だけ添える。",
     "chat_replyのreplyはユウカとして1〜3文。todo/reminder/doneの事実は変えない。",
     EXPENSE_CHAT_POLICY,
-    `同じ発言からexpense_candidateとchat_replyを出す場合、chat_replyには「${EXPENSE_CHAT_SUPPRESSION}」を適用してください。`,
     "雑談では、ユーザーが求めていない限り会話を打ち切ったり、別行動へ誘導したりしない。照れ隠しは会話の返答として自然な範囲に留める。",
     "reminder_delete_candidateは未通知リマインダー一覧から最も近いものを選び、確信できる場合はreminder_idを入れてください。曖昧ならcontentだけ入れてreminder_idはnull。",
     "reminder_candidateで「毎日」「毎週月曜」「毎月1日」など繰り返しが明確ならrecurrence_ruleを入れる。曜日は月曜=1、火曜=2、水曜=3、木曜=4、金曜=5、土曜=6、日曜=7。datetimeは最初に通知する次回日時。",
@@ -2402,8 +2410,7 @@ async function chatReplyWithContext(
   env: Env,
   text: string,
   replyChain: ReplyContext[],
-  expenseContext = "",
-  suppressScolding = false
+  expenseContext = ""
 ): Promise<string> {
   try {
     const persona = await loadPersona(env);
@@ -2413,7 +2420,6 @@ async function chatReplyWithContext(
       "Discordの雑談ルームで、先生への返信を書いてください。",
       "先生はリプライ会話の続きとして発言しています。会話の始まりから直近までを文脈として扱い、自然に返してください。",
       EXPENSE_CHAT_POLICY,
-      suppressScolding ? EXPENSE_CHAT_SUPPRESSION : "",
       expenseContext ? "支出状況が渡されている場合は、その数字を踏まえて返してください。数字は支出状況にあるものだけ使い、捏造しないでください。" : "",
       replyChain.length >= 16
         ? "リプライ文脈が上限の8ラリー相当に達しています。必要なら、会話が長く続いていることに軽く触れてよいです。"
@@ -2494,7 +2500,7 @@ function truncateExpenseText(value: unknown, max: number): string {
 }
 
 async function buildExpenseCategoryHistory(env: Env, config: CategoryConfig): Promise<string> {
-  const recent = await listExpenses(env, "all");
+  const recent = await listExpenses(env, { kind: "all" });
   const seen = new Set<string>();
   const history: { item: string; store: string | null; category: string }[] = [];
   for (const expense of recent.slice(0, 30)) {
@@ -2511,9 +2517,10 @@ async function buildExpenseCategoryHistory(env: Env, config: CategoryConfig): Pr
 }
 
 async function buildExpenseContext(env: Env): Promise<string> {
+  const range = currentMonthRange(env);
   const [expenses, summary] = await Promise.all([
-    listExpenses(env, "month"),
-    summarizeExpenseRange(env, "month", EXPENSE_CATEGORY_CONFIG)
+    listExpenses(env, range),
+    summarizeExpenseRange(env, range, EXPENSE_CATEGORY_CONFIG)
   ]);
   const total = summary.total;
   const byCategory = summary.byCategory.slice(0, 6);
@@ -3024,8 +3031,9 @@ async function maybeSendMonthlyExpenseReport(env: Env): Promise<void> {
 
   const start = `${monthKey}-01T00:00:00+09:00`;
   const end = `${monthKey}-${pad(parts.day)}T23:59:59+09:00`;
+  const range = currentMonthRange(env);
   const [summary, rows] = await Promise.all([
-    summarizeExpenseRange(env, "month", EXPENSE_CATEGORY_CONFIG),
+    summarizeExpenseRange(env, range, EXPENSE_CATEGORY_CONFIG),
     env.DB.prepare(
       `SELECT id, amount, category, memo, store, spent_at, created_at
        FROM expenses
@@ -3193,18 +3201,16 @@ async function maybeSendWeeklyMutterResponse(env: Env): Promise<void> {
   await markDailySummarySent(env, summaryKey);
 }
 
-type ExpenseDateRange = { start: string; end: string };
 type ExpenseAggregateRow = { category: string | null; total: number | null };
 type ExpenseTotalRow = { total: number | null };
 
-function expenseDateRange(env: Env, range: string): ExpenseDateRange | null {
-  if (range === "all") return null;
-  const now = new Date();
-  const parts = zonedParts(now, env.TIMEZONE ?? "Asia/Tokyo");
-  return {
-    start: `${parts.year}-${pad(parts.month)}-01T00:00:00+09:00`,
-    end: `${parts.year}-${pad(parts.month)}-${pad(lastDayOfMonth(parts.year, parts.month))}T23:59:59+09:00`
-  };
+function currentMonthRange(env: Env): ExpenseRangeSpec {
+  const parts = zonedParts(new Date(), env.TIMEZONE ?? "Asia/Tokyo");
+  return { kind: "month", year: parts.year, month: parts.month };
+}
+
+function expenseDateRange(range: ExpenseRangeSpec): { start: string; end: string } | null {
+  return expenseRangeBounds(range);
 }
 
 function prepareExpenseRangeQuery(env: Env, query: string, dateRange: ExpenseDateRange | null) {
@@ -3212,8 +3218,8 @@ function prepareExpenseRangeQuery(env: Env, query: string, dateRange: ExpenseDat
   return dateRange ? statement.bind(dateRange.start, dateRange.end) : statement;
 }
 
-async function summarizeExpenseRange(env: Env, range: string, config: CategoryConfig): Promise<ExpenseSummary> {
-  const dateRange = expenseDateRange(env, range);
+async function summarizeExpenseRange(env: Env, range: ExpenseRangeSpec, config: CategoryConfig): Promise<ExpenseSummary> {
+  const dateRange = expenseDateRange(range);
   const where = dateRange ? " WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)" : "";
   const [totalRow, groupedRows] = await Promise.all([
     prepareExpenseRangeQuery(env, `SELECT SUM(amount) AS total FROM expenses${where}`, dateRange)
@@ -3342,8 +3348,8 @@ async function listReminders(env: Env): Promise<ReminderRow[]> {
   return rows.results ?? [];
 }
 
-async function listExpenses(env: Env, range: string): Promise<ExpenseRow[]> {
-  const dateRange = expenseDateRange(env, range);
+async function listExpenses(env: Env, range: ExpenseRangeSpec): Promise<ExpenseRow[]> {
+  const dateRange = expenseDateRange(range);
   const where = dateRange ? " WHERE datetime(spent_at) BETWEEN datetime(?) AND datetime(?)" : "";
   const rows = await prepareExpenseRangeQuery(
     env,
@@ -3575,8 +3581,10 @@ function formatExpenseCandidate(
   ].join("\n");
 }
 
-function formatExpenses(rows: ExpenseRow[], range: string, env: Env, summary: ExpenseSummary): string {
-  const title = range === "all" ? "支出メモ (all / 直近10件)" : "支出メモ (今月 / 直近10件)";
+function formatExpenses(rows: ExpenseRow[], range: ExpenseRangeSpec, env: Env, summary: ExpenseSummary): string {
+  const title = range.kind === "all"
+    ? "支出メモ (全期間 / 直近10件)"
+    : `支出メモ (${range.year}年${range.month}月 / 直近10件)`;
   if (!rows.length) return `${title}: なし`;
   const visible = rows.slice(0, 10);
   const hierarchy = buildExpenseHierarchyParts(visible, EXPENSE_CATEGORY_CONFIG, undefined, summary);
@@ -4008,10 +4016,6 @@ function todayLoadWarning(total: number): string {
 function isLastDayOfMonth(parts: { year: number; month: number; day: number }): boolean {
   const tomorrow = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + 1));
   return tomorrow.getUTCDate() === 1;
-}
-
-function lastDayOfMonth(year: number, month: number): number {
-  return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 
 function normalizeRecurrenceRule(value: unknown, datetime: string | null, timezone: string): RecurrenceRule | null {

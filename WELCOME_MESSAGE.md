@@ -50,7 +50,7 @@ todo期限には完了/まだ→再通知を選択。再通知は知らせ直す
 
 `/todo list`（range: today/week/all）
 `/reminder list` … 削除ボタン付き
-`/expense list`（range: month/all）
+`/expense list`（期間: 今月・先月・先々月・全期間／月: 2026-07 や 7月）
 `/request list` … 自分の機能要望の受付状況
 `/guide` … コマンド説明
 #雑談で「昼のリマインダー消して」でも対応します。

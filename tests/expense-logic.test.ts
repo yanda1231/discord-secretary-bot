@@ -2,14 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildExpenseHierarchyParts,
+  dropChatReplyWhenExpenseCard,
+  expenseRangeBounds,
   findCategoryDesignation,
   fitDiscordContent,
   formatExpenseHierarchy,
   hasCorrectionCue,
+  isExpenseCandidateComplete,
   normalizeExpenseCategory,
   parseExpenseCorrection,
+  parseExpenseMonth,
   resolveCorrectionTarget,
+  resolveExpenseRange,
+  SCOLD_LEVEL1_MIN_AMOUNT,
   SCOLD_LEVEL2_MIN_AMOUNT,
+  SCOLD_LEVEL3_MIN_AMOUNT,
   scoldLevel,
   type CategoryConfig
 } from "../src/expense-logic.ts";
@@ -22,6 +29,7 @@ import {
   REQUEST_DETAILS_UPDATE_SQL
 } from "../src/request-logic.ts";
 import { expenseAiComment } from "../src/expense-comment.ts";
+import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2 } from "../src/yuuka-phrases.ts";
 
 const categoryConfig: CategoryConfig = {
   categories: ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"],
@@ -187,24 +195,29 @@ test("支出訂正の決定論パーサー", () => {
   });
 });
 
-test("趣味の支出だけ金額で叱り尺度を決める", () => {
-  assert.equal(SCOLD_LEVEL2_MIN_AMOUNT, 10_000);
+test("趣味の支出だけ金額で4段階の叱り尺度を決める", () => {
+  assert.equal(SCOLD_LEVEL1_MIN_AMOUNT, 10_000);
+  assert.equal(SCOLD_LEVEL2_MIN_AMOUNT, 20_000);
+  assert.equal(SCOLD_LEVEL3_MIN_AMOUNT, 40_000);
   assert.equal(scoldLevel("食費", 50_000), 0);
   assert.equal(scoldLevel("サブスク", 50_000), 0);
   assert.equal(scoldLevel("交際費", 50_000), 0);
-  assert.equal(scoldLevel("趣味", 2_000), 1);
-  assert.equal(scoldLevel("趣味", 9_999), 1);
+  assert.equal(scoldLevel("趣味", 9_999), 0);
+  assert.equal(scoldLevel("趣味", SCOLD_LEVEL1_MIN_AMOUNT), 1);
+  assert.equal(scoldLevel("趣味", 19_999), 1);
   assert.equal(scoldLevel("趣味", SCOLD_LEVEL2_MIN_AMOUNT), 2);
-  assert.equal(scoldLevel(normalizeExpenseCategory("ゲーム", categoryConfig), 15_000), 2);
+  assert.equal(scoldLevel("趣味", 39_999), 2);
+  assert.equal(scoldLevel("趣味", SCOLD_LEVEL3_MIN_AMOUNT), 3);
+  assert.equal(scoldLevel(normalizeExpenseCategory("ゲーム", categoryConfig), 15_000), 1);
 });
 
-test("支出コメント生成は尺度0でAIを呼ばず、尺度1・2で1回だけ呼ぶ", async () => {
+test("支出コメント生成は尺度0でAIを呼ばず、尺度1〜3で1回だけ呼ぶ", async () => {
   let calls = 0;
   const loadPersona = async (): Promise<string> => "テスト用ユウカ";
   const generate = async (prompt: string, temperature: number): Promise<string> => {
     calls += 1;
     assert.ok(prompt.length > 0);
-    assert.equal(temperature, 0.9);
+    assert.equal(temperature, 0.6);
     return "記録できる形に整えておきます。";
   };
 
@@ -212,8 +225,89 @@ test("支出コメント生成は尺度0でAIを呼ばず、尺度1・2で1回�
   assert.equal(calls, 0);
   await expenseAiComment(1, 2_000, "趣味", "本", null, loadPersona, generate);
   assert.equal(calls, 1);
-  await expenseAiComment(2, 10_000, "趣味", "ゲーム機", "店", loadPersona, generate);
+  await expenseAiComment(2, 20_000, "趣味", "ゲーム機", "店", loadPersona, generate);
   assert.equal(calls, 2);
+  await expenseAiComment(3, 40_000, "趣味", "ゲーム機", "店", loadPersona, generate);
+  assert.equal(calls, 3);
+});
+
+test("支出コメント生成は空応答・例外時に各段階の定型へ戻る", async () => {
+  const loadPersona = async (): Promise<string> => "テスト用ユウカ";
+  const empty = async (): Promise<string> => "";
+  assert.ok(expenseAsidesLevel1.includes(await expenseAiComment(1, 10_000, "趣味", "本", null, loadPersona, empty)));
+  assert.deepEqual(await expenseAiComment(2, 20_000, "趣味", "本", null, loadPersona, empty), expenseAsidesLevel2[0]);
+  assert.equal(
+    await expenseAiComment(3, 40_000, "趣味", "本", null, loadPersona, empty),
+    "先生！？ その支出額は会計担当として見過ごせません。まずは記録して、あとで予算を再計算しますよ。"
+  );
+  const throws = async (): Promise<string> => {
+    throw new Error("test failure");
+  };
+  assert.deepEqual(await expenseAiComment(2, 20_000, "趣味", "本", null, loadPersona, throws), expenseAsidesLevel2[0]);
+});
+
+test("月の入力は年月・日付・月名を正規化し、境界外を無効にする", () => {
+  const today = { year: 2026, month: 10 };
+  assert.deepEqual(parseExpenseMonth("2026-07", today), { kind: "month", year: 2026, month: 7 });
+  assert.deepEqual(parseExpenseMonth("2026/7", today), { kind: "month", year: 2026, month: 7 });
+  assert.deepEqual(parseExpenseMonth("２０２６年７月", today), { kind: "month", year: 2026, month: 7 });
+  assert.deepEqual(parseExpenseMonth("2026-07-15", today), { kind: "month", year: 2026, month: 7 });
+  assert.deepEqual(parseExpenseMonth("7月", today), { kind: "month", year: 2026, month: 7 });
+  assert.deepEqual(parseExpenseMonth("12月", today), { kind: "month", year: 2025, month: 12 });
+  assert.deepEqual(parseExpenseMonth("10月", today), { kind: "month", year: 2026, month: 10 });
+  assert.deepEqual(parseExpenseMonth("7", today), { kind: "month", year: 2026, month: 7 });
+  assert.deepEqual(parseExpenseMonth("2027-01", today), { kind: "month", year: 2027, month: 1 });
+  for (const input of ["2026-00", "2026-13", "0000-01", "13月", "来月", "7.5", ""]) {
+    assert.deepEqual(parseExpenseMonth(input, today), { kind: "invalid" }, input);
+  }
+});
+
+test("期間指定は月入力を優先し、旧値と年跨ぎを解決する", () => {
+  assert.deepEqual(resolveExpenseRange({}, { year: 2026, month: 10 }), { kind: "month", year: 2026, month: 10 });
+  assert.deepEqual(resolveExpenseRange({ range: "month" }, { year: 2026, month: 10 }), { kind: "month", year: 2026, month: 10 });
+  assert.deepEqual(resolveExpenseRange({ range: "last_month" }, { year: 2026, month: 10 }), { kind: "month", year: 2026, month: 9 });
+  assert.deepEqual(resolveExpenseRange({ range: "two_months_ago" }, { year: 2026, month: 10 }), { kind: "month", year: 2026, month: 8 });
+  assert.deepEqual(resolveExpenseRange({ range: "last_month" }, { year: 2026, month: 1 }), { kind: "month", year: 2025, month: 12 });
+  assert.deepEqual(resolveExpenseRange({ range: "two_months_ago" }, { year: 2026, month: 2 }), { kind: "month", year: 2025, month: 12 });
+  assert.deepEqual(resolveExpenseRange({ range: "all" }, { year: 2026, month: 10 }), { kind: "all" });
+  assert.deepEqual(resolveExpenseRange({ range: "all", month: "7月" }, { year: 2026, month: 10 }), { kind: "month", year: 2026, month: 7 });
+  assert.deepEqual(resolveExpenseRange({ range: "zzz" }, { year: 2026, month: 10 }), { kind: "invalid" });
+});
+
+test("期間の境界はうるう年と全期間を正しく表す", () => {
+  assert.deepEqual(expenseRangeBounds({ kind: "month", year: 2028, month: 2 }), {
+    start: "2028-02-01T00:00:00+09:00",
+    end: "2028-02-29T23:59:59+09:00"
+  });
+  assert.equal(expenseRangeBounds({ kind: "month", year: 2026, month: 12 })?.end, "2026-12-31T23:59:59+09:00");
+  assert.equal(expenseRangeBounds({ kind: "all" }), null);
+});
+
+test("支出候補の完全性をカード条件と共有する", () => {
+  assert.equal(isExpenseCandidateComplete({ amount: 500, item: "電池" }), true);
+  assert.equal(isExpenseCandidateComplete({ amount: null, item: "電池" }), false);
+  assert.equal(isExpenseCandidateComplete({ amount: 500, content: "昼食代" }), true);
+  assert.equal(isExpenseCandidateComplete({ amount: 500, item: "" }), false);
+});
+
+test("完全な支出候補がある時だけ通常の雑談返信を落とし、要望案内は残す", () => {
+  const expense = { type: "expense_candidate" as const, amount: 500, item: "電池" };
+  const chat = { type: "chat_reply" as const, reply: "通常返信" };
+  const guidance = { type: "chat_reply" as const, request_guidance: true, reply: "要望案内" };
+  const todo = { type: "todo_candidate" as const, content: "作業" };
+  assert.deepEqual(dropChatReplyWhenExpenseCard([expense, chat, guidance, todo]), [expense, guidance, todo]);
+  assert.deepEqual(
+    dropChatReplyWhenExpenseCard([{ type: "expense_candidate" as const, amount: null, item: "電池" }, chat]),
+    [{ type: "expense_candidate", amount: null, item: "電池" }, chat]
+  );
+  assert.deepEqual(dropChatReplyWhenExpenseCard([chat]), [chat]);
+});
+
+test("支出コメントの定型文は評価や忠告を含めず句点で終わる", () => {
+  for (const phrase of [...expenseAsides, ...expenseAsidesLevel1, ...expenseAsidesLevel2]) {
+    assert.match(phrase, /。$/);
+    assert.doesNotMatch(phrase, /小言|計画的|積もれば|感謝|！|？/);
+  }
 });
 
 test("訂正の合図と対象決定の5分岐", () => {
