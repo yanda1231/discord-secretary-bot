@@ -10,6 +10,7 @@ export type CategoryConfig = {
   categories: readonly string[];
   aliases: Readonly<Record<string, string>>;
   plannedWords?: readonly string[];
+  savingsWords?: readonly string[];
 };
 
 export const SCOLD_LEVEL1_MIN_AMOUNT = 10_000;
@@ -174,6 +175,13 @@ export type ExpenseSummary = {
   byCategory: readonly ExpenseCategoryTotal[];
 };
 
+export type SavingsStatusRow = {
+  memo: string | null;
+  total: number | null;
+  n: number | null;
+  last: string | null;
+};
+
 const CATEGORY_DESIGNATION_SUFFIXES = ["で", "に", "として"] as const;
 const CORRECTION_CUE = /にして|に変えて|じゃなくて|直して|訂正|さっきの|間違い|違う|ちがう/;
 
@@ -326,10 +334,52 @@ function plannedWords(config: CategoryConfig): string[] {
     .sort((a, b) => b.length - a.length);
 }
 
+function savingsWords(config: CategoryConfig): string[] {
+  return (config.savingsWords ?? [])
+    .map((word) => word.normalize("NFKC").trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+}
+
 /** Find the deterministic words that declare a purchase was planned. */
 export function findPlannedPurchaseDesignation(text: string, config: CategoryConfig): boolean {
   const normalized = text.normalize("NFKC");
   return plannedWords(config).some((word) => normalized.includes(word));
+}
+
+/** Find a deterministic declaration that the purchase was paid from savings. */
+export function findPaidFromSavings(text: string, config: CategoryConfig): boolean {
+  const normalized = text.normalize("NFKC");
+  return savingsWords(config).some((word) => normalized.includes(word));
+}
+
+/** Accept only a standalone savings declaration when cancelling a pending card. */
+export function isStandaloneSavingsDeclaration(text: string, config: CategoryConfig): boolean {
+  const normalized = text
+    .normalize("NFKC")
+    .trim()
+    .replace(/^[。、！？!?]+|[。、！？!?]+$/g, "")
+    .trim();
+  const words = savingsWords(config);
+  if (!normalized || !words.length) return false;
+  const pattern = new RegExp(`^(?:${words.map(escapeRegExp).join("|")})(?:です|でした|だよ|だ|ね|よ)?$`);
+  return pattern.test(normalized);
+}
+
+export type SavingsSuppressionResult<T> = {
+  events: T[];
+  suppressed: boolean;
+};
+
+/** Suppress one complete purchase paid from savings while retaining other actionable events. */
+export function dropExpensesPaidFromSavings<T extends ExpenseCandidateEventLike>(events: T[], paidFromSavings: boolean): SavingsSuppressionResult<T> {
+  const expenseCandidates = events.filter((event) => event.type === "expense_candidate");
+  const suppressed = paidFromSavings && expenseCandidates.length === 1 && isExpenseCandidateComplete(expenseCandidates[0]);
+  if (!suppressed) return { events, suppressed: false };
+  return {
+    events: events.filter((event) => event.type !== "expense_candidate" && !(event.type === "chat_reply" && !event.request_guidance)),
+    suppressed: true
+  };
 }
 
 /** Remove every planned-purchase declaration before the existing correction parser sees the rest. */
@@ -415,6 +465,20 @@ function formatExpenseDay(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric" }).format(date);
+}
+
+export function formatSavingsStatus(rows: readonly SavingsStatusRow[]): string {
+  if (!rows.length) return "貯金の積立: なし";
+  return [
+    "貯金の積立（名前ごとの累計・全期間・最新50名称）",
+    ...rows.map((row) => {
+      const memo = String(row.memo ?? "").trim() || "名前なし";
+      const total = Number(row.total ?? 0).toLocaleString("ja-JP");
+      const count = Math.max(0, Math.round(Number(row.n ?? 0)));
+      const last = row.last ? formatExpenseDay(row.last) : "不明";
+      return `${memo}: ${total}円（${count}回・最終 ${last}）`;
+    })
+  ].join("／");
 }
 
 function expenseDetail(row: ExpenseLikeRow, category: string): string {

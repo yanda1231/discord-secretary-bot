@@ -11,12 +11,16 @@ import {
 import {
   buildExpenseHierarchyParts,
   dropChatReplyWhenExpenseCard,
+  dropExpensesPaidFromSavings,
   expenseRangeBounds,
   findCategoryDesignation,
+  findPaidFromSavings,
   findPlannedPurchaseDesignation,
+  formatSavingsStatus,
   fitDiscordContent,
   hasCorrectionCue,
   isExpenseCandidateComplete,
+  isStandaloneSavingsDeclaration,
   lastDayOfMonth,
   normalizeExpenseCategory,
   normalizeExpenseMemo,
@@ -33,7 +37,8 @@ import {
   type ExpenseCorrection,
   type ExpenseDateRange,
   type ExpenseRangeSpec,
-  type ExpenseSummary
+  type ExpenseSummary,
+  type SavingsStatusRow
 } from "./expense-logic";
 import {
   formatRequestList,
@@ -52,7 +57,8 @@ import expenseCategories from "./expense-categories.json";
 const EXPENSE_CATEGORY_CONFIG: CategoryConfig = {
   categories: expenseCategories.categories,
   aliases: expenseCategories.aliases,
-  plannedWords: expenseCategories.planned_words
+  plannedWords: expenseCategories.planned_words,
+  savingsWords: expenseCategories.savings_words
 };
 const EXPENSE_CATEGORIES = EXPENSE_CATEGORY_CONFIG.categories;
 
@@ -272,7 +278,7 @@ const RESPONSE = {
 const EPHEMERAL = 1 << 6;
 const GEMINI_MESSAGE_RETRY_LIMIT = 5;
 const GEMINI_OUTAGE_MINUTES = 30;
-const EXPENSE_CHAT_POLICY = "支出・浪費の話題では、先生が意見や評価を求めた時だけ、会計担当としての所感を丁寧語で1文述べる。文末は「。」で閉じる。求められていない時は、事実の確認と記録の案内にとどめる。話題は先生が出したものに沿う。";
+const EXPENSE_CHAT_POLICY = "支出・浪費の話題では、先生が意見や評価を求めた時だけ、会計担当としての所感を丁寧語で1文述べる。文末は「。」で閉じる。求められていない時は、事実の確認と記録の案内にとどめる。話題は先生が出したものに沿う。貯金の積立は褒める側に数える。貯金の合計は名前ごとの累計であって残高ではない。";
 
 class GeminiUnavailableError extends Error {
   readonly status?: number;
@@ -833,6 +839,13 @@ function isPendingOwner(interaction: DiscordInteraction, pending: PendingActionR
   return interactionUser(interaction).id === pending.requested_by;
 }
 
+async function deleteExpensePendingAction(env: Env, pending: PendingActionRow): Promise<boolean> {
+  const deleted = await env.DB.prepare(
+    "DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?"
+  ).bind(pending.id, pending.requested_by).run();
+  return Boolean(deleted.meta.changes);
+}
+
 async function processExpensePendingAction(
   interaction: DiscordInteraction,
   env: Env,
@@ -851,10 +864,8 @@ async function processExpensePendingAction(
   }
 
   if (action === "cancel") {
-    const deleted = await env.DB.prepare(
-      "DELETE FROM pending_actions WHERE id = ? AND kind = 'expense' AND requested_by = ?"
-    ).bind(pending.id, pending.requested_by).run();
-    return updateMessage(deleted.meta.changes
+    const deleted = await deleteExpensePendingAction(env, pending);
+    return updateMessage(deleted
       ? expenseCancelledContent(payload)
       : EXPENSE_PENDING_UNAVAILABLE);
   }
@@ -1812,6 +1823,23 @@ async function handleExpenseCorrection(env: Env, message: DiscordMessage, pendin
     return;
   }
 
+  if (isStandaloneSavingsDeclaration(message.content, EXPENSE_CATEGORY_CONFIG)) {
+    const deleted = await deleteExpensePendingAction(env, pending);
+    if (!deleted) {
+      await postDiscordReply(env, message.channel_id, message.id, "その候補は期限切れか処理済みです。もう一度教えてください。");
+      return;
+    }
+    const cardMessageId = pending.message_id ?? messageReferenceId(message);
+    if (cardMessageId) {
+      await patchDiscordMessage(env, message.channel_id, cardMessageId, {
+        content: "支出記録を取り消しました。",
+        components: []
+      });
+    }
+    await postDiscordReply(env, message.channel_id, message.id, randomItem(YUUKA_PHRASES.savingsPurchaseReplies));
+    return;
+  }
+
   const plannedCorrection = splitPlannedCorrection(message.content, EXPENSE_CATEGORY_CONFIG);
   let correction = parseExpenseCorrection(plannedCorrection.rest, EXPENSE_CATEGORY_CONFIG);
   if (!correctionFieldEntries(correction).length && plannedCorrection.rest) {
@@ -1975,6 +2003,10 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
   }
 
   if (receiptAttachment) {
+    if (text && findPaidFromSavings(text, EXPENSE_CATEGORY_CONFIG)) {
+      await postDiscordReply(env, message.channel_id, message.id, randomItem(YUUKA_PHRASES.savingsPurchaseReplies));
+      return;
+    }
     const categoryHint = text ? findCategoryDesignation(text, EXPENSE_CATEGORY_CONFIG) : null;
     const planned = text ? findPlannedPurchaseDesignation(text, EXPENSE_CATEGORY_CONFIG) : false;
     const receiptResult = await handleReceiptAttachment(env, message, receiptAttachment, categoryHint, planned);
@@ -1997,8 +2029,15 @@ async function handleChatMessage(env: Env, message: DiscordMessage): Promise<voi
   }
 
   const events = await classifyChatEvents(env, text, replyChain, EXPENSE_CATEGORY_CONFIG);
-  const actionable = dropChatReplyWhenExpenseCard(events.filter((event) => event.type !== "none").slice(0, 4));
-  if (!actionable.length && shouldChatReply(text)) {
+  const candidateEvents = events.filter((event) => event.type !== "none").slice(0, 4);
+  const paidFromSavings = findPaidFromSavings(text, EXPENSE_CATEGORY_CONFIG);
+  const savingsResult = dropExpensesPaidFromSavings(candidateEvents, paidFromSavings);
+  let actionable = savingsResult.events;
+  actionable = dropChatReplyWhenExpenseCard(actionable);
+  if (savingsResult.suppressed) {
+    await postDiscordReply(env, message.channel_id, message.id, randomItem(YUUKA_PHRASES.savingsPurchaseReplies));
+  }
+  if (!actionable.length && shouldChatReply(text) && !savingsResult.suppressed) {
     actionable.push({ type: "chat_reply", content: text });
   }
 
@@ -2530,7 +2569,7 @@ export async function expenseAiComment(
 
 function shouldIncludeExpenseContext(text: string): boolean {
   const normalized = text.normalize("NFKC");
-  if (/(支出|出費|浪費|お金|金額|予算|家計|使いすぎ|使い過ぎ|買い物|購入|課金|節約|貯金|キャッシュフロー|資産|投資|クレジット|カード請求)/.test(normalized)) return true;
+  if (/(支出|出費|浪費|お金|金額|予算|家計|使いすぎ|使い過ぎ|買い物|購入|課金|節約|貯金|積立|貯蓄|貯ま|キャッシュフロー|資産|投資|クレジット|カード請求)/.test(normalized)) return true;
   if (/\d[\d,]*\s*円/.test(normalized)) return true;
   return /(今月|今週|今日|最近).*(いくら|使った|使いすぎ|支出|出費|予算)/.test(normalized);
 }
@@ -2589,9 +2628,12 @@ async function buildExpenseCategoryHistory(env: Env, config: CategoryConfig): Pr
 
 async function buildExpenseContext(env: Env): Promise<string> {
   const range = currentMonthRange(env);
-  const [expenses, summary] = await Promise.all([
+  const [expenses, summary, savingsRows] = await Promise.all([
     listExpenses(env, range),
-    summarizeExpenseRange(env, range, EXPENSE_CATEGORY_CONFIG)
+    summarizeExpenseRange(env, range, EXPENSE_CATEGORY_CONFIG),
+    env.DB.prepare(
+      "SELECT memo, SUM(amount) AS total, COUNT(*) AS n, MAX(spent_at) AS last FROM expenses WHERE category = '貯金' GROUP BY memo ORDER BY last DESC LIMIT 50"
+    ).all<SavingsStatusRow>()
   ]);
   const total = summary.total;
   const byCategory = summary.byCategory.slice(0, 6);
@@ -2600,7 +2642,8 @@ async function buildExpenseContext(env: Env): Promise<string> {
     "支出状況（今月）",
     `合計: ${total.toLocaleString("ja-JP")}円`,
     byCategory.length ? `大分類別: ${byCategory.map((row) => `${row.category}:${row.total.toLocaleString("ja-JP")}円`).join(", ")}` : "大分類別: なし",
-    recent.length ? `直近: ${recent.map((row) => `#${row.id} ${row.memo}${row.store ? ` @ ${row.store}` : ""} ${row.amount.toLocaleString("ja-JP")}円`).join(", ")}` : "直近: なし"
+    recent.length ? `直近: ${recent.map((row) => `#${row.id} ${row.memo}${row.store ? ` @ ${row.store}` : ""} ${row.amount.toLocaleString("ja-JP")}円`).join(", ")}` : "直近: なし",
+    formatSavingsStatus(savingsRows.results ?? [])
   ].join("\n");
 }
 
@@ -3317,6 +3360,7 @@ async function monthlyExpenseAiComment(env: Env, monthKey: string, total: number
     return await geminiText(env, [
       personaPrompt(persona),
       "月末昼の支出レポート冒頭をユウカとして3文以内で書いてください。会計担当らしく、少し小言を言ってもよいが、記録できたことは評価する。事実・金額は変えない。",
+      "大分類「貯金」は将来の買い物のための積立として扱い、褒める側に数える。",
       `対象月: ${monthKey}`,
       `合計: ${total}円`,
       `大分類別: ${byCategory.map((row) => `${row.category}:${row.total}円`).join(", ") || "なし"}`,

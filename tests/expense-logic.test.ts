@@ -3,14 +3,18 @@ import test from "node:test";
 import {
   buildExpenseHierarchyParts,
   dropChatReplyWhenExpenseCard,
+  dropExpensesPaidFromSavings,
   expenseRangeBounds,
   findCategoryDesignation,
+  findPaidFromSavings,
   findPlannedPurchaseDesignation,
   fitDiscordContent,
+  formatSavingsStatus,
   formatExpenseHierarchy,
   hasCorrectionCue,
   isExpenseCandidateComplete,
   isPlannedPayload,
+  isStandaloneSavingsDeclaration,
   normalizeExpenseCategory,
   parseExpenseCorrection,
   parseExpenseMonth,
@@ -32,18 +36,21 @@ import {
   REQUEST_DETAILS_UPDATE_SQL
 } from "../src/request-logic.ts";
 import { expenseAiComment } from "../src/expense-comment.ts";
-import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3, expenseAsidesPlanned } from "../src/yuuka-phrases.ts";
+import { expenseAsides, expenseAsidesLevel1, expenseAsidesLevel2, expenseAsidesLevel3, expenseAsidesPlanned, savingsPurchaseReplies } from "../src/yuuka-phrases.ts";
 
 const categoryConfig: CategoryConfig = {
-  categories: ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "住居", "その他"],
+  categories: ["食費", "雑費", "日用品", "交通費", "交際費", "医療費", "趣味", "サブスク", "貯金", "住居", "その他"],
   aliases: {
     "交通": "交通費",
     "ゲーム": "趣味",
     "書籍": "趣味",
     "交際": "交際費",
-    "医療": "医療費"
+    "医療": "医療費",
+    "積立": "貯金",
+    "貯蓄": "貯金"
   },
-  plannedWords: ["計画購入", "計画買い", "貯金から", "積立から", "貯めた分", "貯めてた分", "貯めていた分", "予定どおり", "予定通り"]
+  plannedWords: ["計画購入", "計画買い", "貯めた分", "貯めてた分", "貯めていた分", "予定どおり", "予定通り"],
+  savingsWords: ["貯金から", "積立から", "貯蓄から"]
 };
 
 test("機能要望の決定論トリガーは取消・先頭・含有の順で解決する", () => {
@@ -187,7 +194,8 @@ test("旧分類別名は正規化時だけ新分類へ対応付ける", () => {
 
 test("計画購入の宣言は本文と訂正の残りを決定論で分ける", () => {
   assert.equal(findPlannedPurchaseDesignation("計画購入 グラボ 45000円", categoryConfig), true);
-  assert.equal(findPlannedPurchaseDesignation("貯金からです", categoryConfig), true);
+  assert.equal(findPlannedPurchaseDesignation("貯金からです", categoryConfig), false);
+  assert.equal(findPlannedPurchaseDesignation("貯めた分で買った", categoryConfig), true);
   assert.equal(findPlannedPurchaseDesignation("予定どおりに買った", categoryConfig), true);
   assert.equal(findPlannedPurchaseDesignation("計画購入", categoryConfig), true);
   assert.equal(findPlannedPurchaseDesignation("計画を立てる", categoryConfig), false);
@@ -204,6 +212,62 @@ test("計画購入の宣言は本文と訂正の残りを決定論で分ける",
   assert.equal(isPlannedPayload({}), false);
   assert.equal(isPlannedPayload({ planned: "1" }), true);
   assert.equal(isPlannedPayload({ planned: "yes" }), false);
+});
+
+test("貯金からの購入は計画購入と別の固定語で判定する", () => {
+  assert.equal(findPaidFromSavings("グラボ買った 60000円 貯金から", categoryConfig), true);
+  assert.equal(findPaidFromSavings("積立からです", categoryConfig), true);
+  assert.equal(findPaidFromSavings("貯蓄から", categoryConfig), true);
+  assert.equal(findPaidFromSavings("貯めた分で買った", categoryConfig), false);
+  assert.equal(findPaidFromSavings("グラボ貯金 1万円", categoryConfig), false);
+  assert.equal(findPaidFromSavings("貯金が減った", categoryConfig), false);
+});
+
+test("貯金からの購入は支出1件の時だけ候補と通常返信を抑止する", () => {
+  const expense = { type: "expense_candidate" as const, amount: 60_000, item: "グラボ" };
+  const chat = { type: "chat_reply" as const, reply: "通常返信" };
+  const guidance = { type: "chat_reply" as const, request_guidance: true, reply: "要望案内" };
+  const todo = { type: "todo_candidate" as const, content: "箱を片付ける" };
+  const one = dropExpensesPaidFromSavings([expense, chat, todo], true);
+  assert.deepEqual(one.events, [todo]);
+  assert.equal(one.suppressed, true);
+  const withGuidance = dropExpensesPaidFromSavings([expense, guidance, todo], true);
+  assert.deepEqual(withGuidance.events, [guidance, todo]);
+  assert.equal(withGuidance.suppressed, true);
+  const secondExpense = { type: "expense_candidate" as const, amount: 500, item: "昼食" };
+  const multiple = dropExpensesPaidFromSavings([expense, secondExpense, chat], true);
+  assert.deepEqual(multiple.events, [expense, secondExpense, chat]);
+  assert.equal(multiple.suppressed, false);
+  const none = dropExpensesPaidFromSavings([chat, todo], true);
+  assert.deepEqual(none.events, [chat, todo]);
+  assert.equal(none.suppressed, false);
+  const disabled = dropExpensesPaidFromSavings([expense, chat], false);
+  assert.deepEqual(disabled.events, [expense, chat]);
+  assert.equal(disabled.suppressed, false);
+});
+
+test("貯金からのリプライは宣言だけをカード取消として受け付ける", () => {
+  for (const input of ["貯金から", "貯金からです。", "積立からだよ", "　貯蓄から　"]) {
+    assert.equal(isStandaloneSavingsDeclaration(input, categoryConfig), true, input);
+  }
+  for (const input of ["貯金からではなく現金", "グラボ 貯金から", "貯金からで雑費にして"]) {
+    assert.equal(isStandaloneSavingsDeclaration(input, categoryConfig), false, input);
+  }
+});
+
+test("貯金カテゴリは別名を正規化し、積立の進み具合を名前ごとに表示する", () => {
+  assert.equal(normalizeExpenseCategory("貯金", categoryConfig), "貯金");
+  assert.equal(normalizeExpenseCategory("積立", categoryConfig), "貯金");
+  assert.equal(normalizeExpenseCategory("貯蓄", categoryConfig), "貯金");
+  assert.equal(findCategoryDesignation("貯金で グラボ 1万円", categoryConfig), "貯金");
+  assert.equal(formatSavingsStatus([]), "貯金の積立: なし");
+  const output = formatSavingsStatus([
+    { memo: "グラボ貯金", total: 30_000, n: 3, last: "2026-10-20T12:00:00+09:00" },
+    { memo: "旅行貯金", total: 12_500, n: 2, last: "2026-09-05T12:00:00+09:00" }
+  ]);
+  assert.match(output, /^貯金の積立（名前ごとの累計・全期間・最新50名称）／/);
+  assert.match(output, /グラボ貯金: 30,000円（3回・最終 10\/20）/);
+  assert.match(output, /旅行貯金: 12,500円（2回・最終 9\/5）/);
 });
 
 test("支出訂正の決定論パーサー", () => {
@@ -368,6 +432,7 @@ test("完全な支出候補がある時だけ通常の雑談返信を落とし�
 test("支出コメントの定型文は段階ごとの本数と禁止語を守る", () => {
   assert.equal(expenseAsides.length, 7);
   assert.equal(expenseAsidesPlanned.length, 5);
+  assert.equal(savingsPurchaseReplies.length, 5);
   assert.equal(expenseAsidesLevel1.length, 5);
   assert.equal(expenseAsidesLevel2.length, 5);
   assert.equal(expenseAsidesLevel3.length, 5);
@@ -378,6 +443,10 @@ test("支出コメントの定型文は段階ごとの本数と禁止語を守�
   for (const phrase of expenseAsidesPlanned) {
     assert.match(phrase, /。$/);
     assert.doesNotMatch(phrase, /！|？|小言/);
+  }
+  for (const phrase of savingsPurchaseReplies) {
+    assert.match(phrase, /。$/);
+    assert.doesNotMatch(phrase, /！|？/);
   }
   for (const phrase of [...expenseAsidesLevel1, ...expenseAsidesLevel2]) {
     assert.match(phrase, /。$/);
